@@ -66,11 +66,23 @@ Estas decisiones tienen motivo y revertirlas causa fallos difíciles de ver:
 - **`_detencion_pedida`** distingue una parada nuestra de una caída real: FFmpeg
   sale con código distinto de cero de forma legítima cuando lo paramos nosotros.
 
-## Numeración de asaltos
+## Numeración de asaltos y estructura de carpetas
 
-Se deduce escaneando las carpetas `asalto_NNN*` existentes, no de un contador en
-memoria. Así la numeración sobrevive a un reinicio de la aplicación en mitad del
-evento. Renombrar o borrar carpetas altera el siguiente número asignado.
+`grabaciones/MIERCOLES_22/007_Garcia_Lopez/` — jornada, luego `ID_NOMBRE1_NOMBRE2`.
+La numeración es continua durante toda la competición, no reinicia por jornada.
+
+El contador está en `config.json` (`ultimo_asalto`) y se escribe al **iniciar** el
+asalto, no al terminarlo: si la aplicación muere a mitad, el número queda
+reservado y no se reutiliza.
+
+`_maximo_en_disco()` es solo una red de seguridad por si `config.json` se pierde.
+Exige tres condiciones para contar una carpeta, y las tres importan:
+carpeta de jornada válida (`_RE_JORNADA`), nombre `NNN` de tres dígitos
+(`_RE_ASALTO`), y **presencia de `metadata.json`**. Sin la última, una carpeta
+creada a mano como `500_revisar` dispararía el contador a 501.
+
+Al cambiar el formato de los nombres, revisar también el `glob("*/*")` de
+`_subir()` en `app.py`: recorre la estructura anidada y es fácil olvidarlo.
 
 ## Verificar cambios en la grabación
 

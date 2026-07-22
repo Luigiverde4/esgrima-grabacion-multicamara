@@ -28,12 +28,25 @@ Se replica tal cual en `personal:ESGRIMA_26`:
 
 ```
 grabaciones/
-  asalto_001_Garcia-vs-Lopez/
-    cam1.mkv          Lateral izquierda
-    cam2.mkv          Frontal
-    cam3.mkv          Lateral derecha
-    metadata.json     tiempos, duración e incidencias
+  MIERCOLES_22/                 carpeta de la jornada
+    001_Garcia_Lopez/           ID_NOMBRE1_NOMBRE2
+      cam1.mkv                  Lateral izquierda
+      cam2.mkv                  Frontal
+      cam3.mkv                  Lateral derecha
+      metadata.json             tiempos, duración e incidencias
+    002_Munoz_Perez/
+  JUEVES_23/
+    003_Ruiz_Sanz/
 ```
+
+La numeración es **continua durante toda la competición**, no se reinicia cada
+jornada: así el asalto 47 es único y basta su número para identificarlo.
+
+El contador vive en `config.json` (`ultimo_asalto`) y se guarda al **iniciar**
+cada asalto, de modo que un cierre inesperado no reutiliza un número. Renombrar
+carpetas ya no lo altera. Como respaldo, se contrasta con los asaltos que haya
+en disco: si `config.json` se pierde o se restaura una copia antigua, la
+numeración no retrocede sobre material ya grabado.
 
 ## Hardware
 
@@ -65,6 +78,9 @@ Si no coincide, reordenar los nombres en `config.json`.
 - **Parada con `q`, no matando el proceso.** Es lo que permite que el fichero quede
   con su duración escrita.
 - **Subida con `rclone copy`, nunca `sync`.** `sync` borraría en destino.
+- **`--min-age 30s` en la subida.** rclone falla al copiar un fichero que está
+  creciendo. El botón ya se bloquea mientras se graba, pero esto cubre además
+  una segunda instancia abierta o una subida lanzada desde la consola.
 
 ## Pendiente
 
