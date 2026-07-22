@@ -1,0 +1,83 @@
+# ESGRIMA_26 — Grabación multicámara de asaltos
+
+Soporte de grabación para una competición de esgrima: tres cámaras sobre la pista,
+un fichero por POV y asalto, y subida a OneDrive al terminar el evento.
+
+## Uso
+
+```
+python app.py
+```
+
+1. Escribir los tiradores (opcional) y pulsar **INICIAR ASALTO**.
+2. Pulsar **DETENER ASALTO** al acabar.
+3. Repetir. La numeración es automática y continúa aunque se reinicie la aplicación.
+4. Al terminar la jornada, **Subir todo a OneDrive**.
+
+Durante la grabación, cada cámara muestra un indicador:
+
+| Color | Significado |
+|-------|-------------|
+| Verde | Grabando correctamente |
+| Ámbar | Sin señal — imagen congelada (revisar cable HDMI) |
+| Rojo  | Cámara caída |
+
+## Estructura resultante
+
+Se replica tal cual en `personal:ESGRIMA_26`:
+
+```
+grabaciones/
+  asalto_001_Garcia-vs-Lopez/
+    cam1.mkv          Lateral izquierda
+    cam2.mkv          Frontal
+    cam3.mkv          Lateral derecha
+    metadata.json     tiempos, duración e incidencias
+```
+
+## Hardware
+
+- 3 × capturadora HDMI → USB 3.0 (ALBURAN, 1080p60)
+- Repartir las tres en **puertos de controladores distintos**. El equipo tiene
+  cuatro controladores USB 3.10 independientes, así que hay margen de sobra.
+
+## Configuración
+
+`config.json`:
+
+- `video.resolucion` / `video.fps` — 1080p30 por defecto. Suficiente para revisión
+  técnica; subir a 60 fps triplica el tamaño y rara vez aporta.
+- `video.crf` — 21 es calidad alta. Subir el número reduce tamaño y calidad.
+- `camaras[].dispositivo` — `null` activa el modo prueba (patrón `testsrc2`,
+  sin necesidad de hardware). Se rellena con **Detectar capturadoras**.
+- `rclone_destino` — `personal:ESGRIMA_26`.
+
+Tras detectar las capturadoras, **verificar que el orden coincide con la posición
+real en la pista**; FFmpeg las enumera por orden del sistema, no por ubicación.
+Si no coincide, reordenar los nombres en `config.json`.
+
+## Decisiones de diseño
+
+- **MKV, no MP4.** Si se corta la luz o el programa muere, un MP4 queda corrupto e
+  irrecuperable; un MKV se reproduce hasta donde llegó.
+- **Un proceso FFmpeg por cámara.** Si una capturadora se desconecta, las otras dos
+  siguen grabando.
+- **Parada con `q`, no matando el proceso.** Es lo que permite que el fichero quede
+  con su duración escrita.
+- **Subida con `rclone copy`, nunca `sync`.** `sync` borraría en destino.
+
+## Pendiente
+
+- Audio (previsto para más adelante).
+- Previsualización en vivo de los tres POVs (requeriría MediaMTX).
+
+## Notas originales
+
+Vamos a dar soporte a una competición de esgrima.
+Vamos a montar una pista con cámaras (mínimo 3) para grabar distintos asaltos.
+
+La idea es iniciar a grabar cuando se inicie un asalto y parar la grabación cuando termine.
+
+Mandar a través de RCLONE a una carpeta en OneDrive. En esa carpeta, tener carpetas
+individuales por asalto para tener los tres POVs.
+En RCLONE es el sitio de "personal:" y la carpeta está en la raíz "ESGRIMA_26"
