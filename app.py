@@ -25,6 +25,7 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 import dispositivos
+import mosaico
 import subida
 from grabador import Sesion
 
@@ -46,8 +47,10 @@ class App(tk.Tk):
         self.subiendo = False       # bloquea grabar y subir a la vez
         self._firma_lista = None    # evita repintar la lista sin cambios
         self._previews: dict[str, subprocess.Popen] = {}  # ffplay por camara
-        self._video_disp: list[str] = []   # ultimo listado de dispositivos
-        self._audio_disp: list[str] = []
+        self._video_disp: list = []   # ultimo listado de Dispositivo (video)
+        self._audio_disp: list = []   # ultimo listado de Dispositivo (audio)
+        self._map_video: dict = {}    # etiqueta visible -> Dispositivo
+        self._map_audio: dict = {}
 
         self._construir()
         # Rellena los desplegables una vez montada la interfaz (necesita el log).
@@ -107,10 +110,13 @@ class App(tk.Tk):
         self.MODO_PRUEBA = "-- Modo prueba (patron) --"
         self.SIN_AUDIO = "-- Sin audio --"
 
+        # Etiquetas visibles del combo de formato -> valor interno.
+        self.FORMATOS = {"MJPEG": "mjpeg", "YUYV": "yuyv422", "Auto": "auto"}
+
         # Una fila (dos lineas) por camara. Cada fila guarda: punto de color,
-        # combo de video, combo de audio, etiqueta de estado y boton Ver. El
-        # orden coincide con self.sesion.camaras y con self.sesion.grabadores;
-        # _refrescar() los empareja con zip().
+        # combo de video, combo de audio, combo de formato, etiqueta de estado y
+        # boton Ver. El orden coincide con self.sesion.camaras y con
+        # self.sesion.grabadores; _refrescar() los empareja con zip().
         self.filas = []
         for cam in self.sesion.camaras:
             marco_cam = ttk.Frame(mc)
@@ -150,7 +156,14 @@ class App(tk.Tk):
             combo_audio.bind("<<ComboboxSelected>>",
                              lambda _e, cid=cam.id, cb=combo_audio: self._elegir_audio(cid, cb))
 
-            self.filas.append((punto, combo, combo_audio, info, ver))
+            # Combo de formato de entrada (MJPEG por defecto, ver _entrada()).
+            combo_fmt = ttk.Combobox(abajo, state="readonly", width=7,
+                                     font=("Segoe UI", 9), values=list(self.FORMATOS))
+            combo_fmt.pack(side="left", padx=(6, 0))
+            combo_fmt.bind("<<ComboboxSelected>>",
+                           lambda _e, cid=cam.id, cb=combo_fmt: self._elegir_formato(cid, cb))
+
+            self.filas.append((punto, combo, combo_audio, combo_fmt, info, ver))
 
         pie = ttk.Frame(mc)
         pie.pack(fill="x", pady=(8, 0))
@@ -254,6 +267,10 @@ class App(tk.Tk):
         for c in fallos:
             self._escribir(f"    ! {c['id']}: {c['error'] or 'fichero vacio'}")
 
+        # Mosaico automatico: solo si las tres camaras grabaron bien. Se hace en
+        # segundo plano para no congelar la app entre asaltos.
+        self._generar_mosaico(meta, fallos)
+
         self.btn.configure(text="INICIAR ASALTO", bg=VERDE, activebackground=VERDE)
         self.entrada.configure(state="normal")
         self.entrada.delete(0, "end")
@@ -269,6 +286,34 @@ class App(tk.Tk):
                 f"{len(fallos)} de {len(meta['camaras'])} camaras han fallado.\n\n"
                 + "\n".join(f"- {c['id']}: {c['error'] or 'fichero vacio'}" for c in fallos)
             )
+
+    def _generar_mosaico(self, meta: dict, fallos: list) -> None:
+        """Lanza la generacion del mosaico en segundo plano, si procede.
+
+        Solo si las tres camaras grabaron bien: un mosaico al que le falta un
+        POV no aporta. El orden de camaras en config es [izq, frontal, der], asi
+        que el frontal es el del medio.
+        """
+        if fallos or len(meta["camaras"]) != 3:
+            return
+        carpeta = Path(meta["carpeta"])
+        # Ficheros por posicion: 0=lateral izq, 1=frontal, 2=lateral der.
+        ficheros = [c["fichero"] for c in meta["camaras"]]
+        if not all(ficheros):
+            return
+        izq, frontal, der = ficheros
+
+        self._escribir(f"Generando mosaico del asalto {meta['asalto']:03d}...")
+        hilo = mosaico.generar(
+            carpeta, frontal=frontal, izquierda=izq, derecha=der,
+            al_terminar=self._fin_mosaico,
+        )
+        if hilo is None:
+            self._escribir("    ! mosaico omitido: falta algun video")
+
+    def _fin_mosaico(self, ok: bool, mensaje: str) -> None:
+        # Llamado desde el hilo del mosaico: al hilo de Tkinter con after.
+        self.after(0, lambda: self._escribir(("" if ok else "    ! ") + mensaje))
 
     # ------------------------------------------------------------ dispositivos
 
@@ -286,6 +331,13 @@ class App(tk.Tk):
         # Video y audio en una sola llamada a FFmpeg, y en memoria para que
         # _elegir_dispositivo pueda autoemparejar sin volver a enumerar.
         self._video_disp, self._audio_disp = dispositivos.listar_video_y_audio()
+
+        # Mapas etiqueta_visible -> Dispositivo. Los combos muestran etiquetas
+        # legibles (desambiguadas si hay nombres repetidos) pero por dentro se
+        # trabaja con el id de hardware. Se reconstruyen en cada refresco.
+        self._map_video = self._construir_mapa(self._video_disp)
+        self._map_audio = self._construir_mapa(self._audio_disp)
+
         self.lbl_disp.configure(
             text=(f"{len(self._video_disp)} video · {len(self._audio_disp)} audio"
                   if self._video_disp else "ningun dispositivo detectado")
@@ -293,21 +345,61 @@ class App(tk.Tk):
         self._escribir(f"Detectados: {len(self._video_disp)} video, "
                        f"{len(self._audio_disp)} audio")
 
-        for (_punto, combo, combo_audio, _info, _ver), cam in zip(
+        # Etiqueta visible del formato guardado de cada camara (mjpeg -> "MJPEG").
+        fmt_a_etiqueta = {v: k for k, v in self.FORMATOS.items()}
+
+        for (_punto, combo, combo_audio, combo_fmt, _info, _ver), cam in zip(
                 self.filas, self.sesion.camaras):
             self._rellenar_combo_video(combo, cam)
             self._rellenar_combo_audio(combo_audio, cam)
+            combo_fmt.set(fmt_a_etiqueta.get(cam.formato, "MJPEG"))
+            # El formato solo aplica con capturadora real.
+            combo_fmt.configure(state="readonly" if cam.configurada else "disabled")
+
+    @staticmethod
+    def _construir_mapa(disps: list) -> dict:
+        """Mapa etiqueta -> Dispositivo, desambiguando nombres repetidos.
+
+        Si dos dispositivos comparten nombre (dos capturadoras identicas), se les
+        anade '(1)', '(2)'... por orden de aparicion, solo en la etiqueta visible.
+        """
+        cuenta: dict[str, int] = {}
+        for d in disps:
+            cuenta[d.nombre] = cuenta.get(d.nombre, 0) + 1
+        vistos: dict[str, int] = {}
+        mapa: dict = {}
+        for d in disps:
+            if cuenta[d.nombre] > 1:
+                vistos[d.nombre] = vistos.get(d.nombre, 0) + 1
+                mapa[d.etiqueta(vistos[d.nombre])] = d
+            else:
+                mapa[d.etiqueta()] = d
+        return mapa
+
+    def _etiqueta_guardada(self, ident: str | None, nombre: str | None,
+                           mapa: dict, vacio: str) -> str:
+        """Etiqueta a mostrar para un id guardado.
+
+        Si el id sigue conectado, se usa su etiqueta actual del mapa. Si no, se
+        muestra el nombre guardado marcado '(no disponible)' para no perder la
+        referencia visible; el id permanece guardado igual.
+        """
+        if not ident:
+            return vacio
+        for etiqueta, disp in mapa.items():
+            if disp.id == ident:
+                return etiqueta
+        return f"{nombre or ident}  (no disponible)"
 
     def _rellenar_combo_video(self, combo: ttk.Combobox, cam) -> None:
         """Opciones y valor del desplegable de video de una camara."""
-        opciones = [self.MODO_PRUEBA] + self._video_disp
-        # Un dispositivo guardado que ya no aparece se conserva como opcion para
-        # no perder la seleccion; se muestra marcado como no disponible.
-        if cam.dispositivo and cam.dispositivo not in self._video_disp:
-            opciones.append(f"{cam.dispositivo}  (no disponible)")
+        etiqueta = self._etiqueta_guardada(cam.dispositivo, cam.dispositivo_nombre,
+                                           self._map_video, self.MODO_PRUEBA)
+        opciones = [self.MODO_PRUEBA] + list(self._map_video)
+        if etiqueta not in opciones and etiqueta != self.MODO_PRUEBA:
+            opciones.append(etiqueta)  # el guardado ya no esta conectado
         combo.configure(values=opciones)
-        combo.set(self._texto_dispositivo(cam.dispositivo, self._video_disp,
-                                          self.MODO_PRUEBA))
+        combo.set(etiqueta)
 
     def _rellenar_combo_audio(self, combo: ttk.Combobox, cam) -> None:
         """Opciones y valor del desplegable de audio (micro) de una camara.
@@ -318,53 +410,53 @@ class App(tk.Tk):
             combo.configure(values=[self.SIN_AUDIO], state="disabled")
             combo.set(self.SIN_AUDIO)
             return
-
-        opciones = [self.SIN_AUDIO] + self._audio_disp
-        if cam.audio and cam.audio not in self._audio_disp:
-            opciones.append(f"{cam.audio}  (no disponible)")
+        etiqueta = self._etiqueta_guardada(cam.audio, cam.audio,
+                                           self._map_audio, self.SIN_AUDIO)
+        opciones = [self.SIN_AUDIO] + list(self._map_audio)
+        if etiqueta not in opciones and etiqueta != self.SIN_AUDIO:
+            opciones.append(etiqueta)
         combo.configure(values=opciones, state="readonly")
-        combo.set(self._texto_dispositivo(cam.audio, self._audio_disp,
-                                          self.SIN_AUDIO))
-
-    @staticmethod
-    def _texto_dispositivo(elegido: str | None, disponibles: list[str],
-                           vacio: str) -> str:
-        """Texto a mostrar en un desplegable segun lo elegido este o no conectado."""
-        if not elegido:
-            return vacio
-        if elegido in disponibles:
-            return elegido
-        return f"{elegido}  (no disponible)"
+        combo.set(etiqueta)
 
     def _elegir_dispositivo(self, cam_id: str, combo: ttk.Combobox) -> None:
         """Guarda la eleccion de video; el micro se autoempareja."""
         if self.sesion.grabando:
             return
-        texto = combo.get()
-        if texto == self.MODO_PRUEBA:
-            dispositivo = None
-        else:
-            dispositivo = texto.split("  (no disponible)")[0]
+        etiqueta = combo.get()
+        # Traduce la etiqueta visible al Dispositivo (o None en modo prueba).
+        dispositivo = self._map_video.get(etiqueta) if etiqueta != self.MODO_PRUEBA else None
 
-        # Al asignar video se autoempareja el micro por el sufijo '(<video>)'.
-        self.sesion.guardar_dispositivos({cam_id: dispositivo}, self._audio_disp)
+        self.sesion.asignar_video(cam_id, dispositivo, self._audio_disp)
         cam = next(c for c in self.sesion.camaras if c.id == cam_id)
-        self._escribir(f"{cam_id} -> {dispositivo or 'modo prueba'}"
-                       + (f"  ·  micro: {cam.audio}" if cam.audio else ""))
-        # Refleja el micro autoemparejado en su combo.
+        if dispositivo:
+            msg = f"{cam_id} -> {dispositivo.nombre}"
+            if cam.audio:
+                msg += f"  ·  micro emparejado"
+            elif self._audio_disp:
+                # Habia micros pero ninguno emparejo con seguridad: avisar.
+                msg += "  ·  micro NO emparejado, eligelo a mano"
+            self._escribir(msg)
+        else:
+            self._escribir(f"{cam_id} -> modo prueba")
+        # Refleja el micro autoemparejado (o su ausencia) en los combos.
         self._refrescar_dispositivos()
 
     def _elegir_audio(self, cam_id: str, combo: ttk.Combobox) -> None:
         """Guarda el micro elegido a mano para una camara."""
         if self.sesion.grabando:
             return
-        texto = combo.get()
-        if texto == self.SIN_AUDIO:
-            audio = None
-        else:
-            audio = texto.split("  (no disponible)")[0]
-        self.sesion.guardar_audio(cam_id, audio)
-        self._escribir(f"{cam_id} · micro -> {audio or 'sin audio'}")
+        etiqueta = combo.get()
+        disp = self._map_audio.get(etiqueta) if etiqueta != self.SIN_AUDIO else None
+        self.sesion.guardar_audio(cam_id, disp.id if disp else None)
+        self._escribir(f"{cam_id} · micro -> {disp.nombre if disp else 'sin audio'}")
+
+    def _elegir_formato(self, cam_id: str, combo: ttk.Combobox) -> None:
+        """Guarda el formato de entrada elegido (MJPEG/YUYV/Auto)."""
+        if self.sesion.grabando:
+            return
+        formato = self.FORMATOS.get(combo.get(), "mjpeg")
+        self.sesion.guardar_formato(cam_id, formato)
+        self._escribir(f"{cam_id} · formato -> {formato}")
 
     def _previsualizar(self, cam_id: str) -> None:
         """Abre (o cierra) una ventana de ffplay con la imagen en vivo.
@@ -397,7 +489,7 @@ class App(tk.Tk):
             return
 
         self._previews[cam_id] = proc
-        self._escribir(f"{cam_id} -> previsualizando {cam.dispositivo}")
+        self._escribir(f"{cam_id} -> previsualizando {cam.dispositivo_nombre or cam.dispositivo}")
 
     def _cerrar_previews(self) -> None:
         """Cierra todas las ventanas de previsualizacion abiertas."""
@@ -548,10 +640,11 @@ class App(tk.Tk):
             info = self.sesion.asalto_actual
             # zip empareja fila i con grabador i: ambas listas siguen el orden
             # de config.json.
-            for (punto, combo, combo_audio, lbl, ver), g in zip(
+            for (punto, combo, combo_audio, combo_fmt, lbl, ver), g in zip(
                     self.filas, self.sesion.grabadores):
                 combo.configure(state="disabled")        # no cambiar fuente al vuelo
                 combo_audio.configure(state="disabled")
+                combo_fmt.configure(state="disabled")
                 ver.configure(state="disabled")          # no previsualizar mientras graba
                 e = g.estado
                 sufijo_audio = " ♪" if g.camara.con_audio else ""
@@ -582,12 +675,14 @@ class App(tk.Tk):
             # En reposo: el punto refleja si la camara tiene fuente asignada
             # (verde apagado) o esta en modo prueba (gris). El combo vuelve a
             # ser seleccionable y la etiqueta de estado se limpia.
-            for (punto, combo, combo_audio, lbl, ver), cam in zip(
+            for (punto, combo, combo_audio, combo_fmt, lbl, ver), cam in zip(
                     self.filas, self.sesion.camaras):
                 punto.configure(fg=VERDE if cam.configurada else GRIS)
                 combo.configure(state="readonly")
-                # El combo de audio solo tiene sentido con video real.
-                combo_audio.configure(state="readonly" if cam.configurada else "disabled")
+                # Audio y formato solo tienen sentido con video real.
+                estado_extra = "readonly" if cam.configurada else "disabled"
+                combo_audio.configure(state=estado_extra)
+                combo_fmt.configure(state=estado_extra)
                 ver.configure(state="normal")
                 lbl.configure(text="")
             n = self.sesion.siguiente_numero()

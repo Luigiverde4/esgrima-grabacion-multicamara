@@ -39,8 +39,10 @@ class Camara:
     """Una camara tal y como esta declarada en config.json."""
     id: str                          # identifica el fichero: cam1.mkv
     nombre: str                      # descripcion para el operador: "Frontal"
-    dispositivo: str | None = None   # nombre DirectShow de video; None => modo prueba
-    audio: str | None = None         # micro DirectShow; None => graba sin audio
+    dispositivo: str | None = None   # id de hardware del video; None => modo prueba
+    dispositivo_nombre: str | None = None  # nombre visible del video, para mostrar
+    audio: str | None = None         # id/nombre DirectShow del micro; None => sin audio
+    formato: str = "mjpeg"           # mjpeg | yuyv422 | auto (formato de entrada)
 
     @property
     def configurada(self) -> bool:
@@ -141,9 +143,23 @@ class GrabadorCamara:
         especificador = f"video={self.camara.dispositivo}"
         if self.camara.con_audio:
             especificador += f":audio={self.camara.audio}"
+
+        # Formato de entrada. Por defecto FFmpeg coge YUYV sin comprimir (~1.5
+        # Gbps a 1080p): tres capturadoras asi saturan el USB 3.0. Pidiendo
+        # MJPEG explicitamente entra comprimido y las tres caben.
+        #   mjpeg    -> -vcodec mjpeg
+        #   yuyv422  -> -pixel_format yuyv422 (rawvideo se fija por pixel_format)
+        #   auto     -> nada, decide FFmpeg
+        seleccion_formato: list[str] = []
+        if self.camara.formato == "mjpeg":
+            seleccion_formato = ["-vcodec", "mjpeg"]
+        elif self.camara.formato == "yuyv422":
+            seleccion_formato = ["-pixel_format", "yuyv422"]
+
         return [
             "-f", "dshow",
             "-rtbufsize", "256M",          # colchon ante microcortes USB
+            *seleccion_formato,
             "-video_size", v["resolucion"],
             "-framerate", str(v["fps"]),
             "-i", especificador,
@@ -410,8 +426,9 @@ class Sesion:
         partir de ellos, no al reves. Asi video y audio nunca se desincronizan.
         """
         camaras = [
-            {"id": c.id, "nombre": c.nombre,
-             "dispositivo": c.dispositivo, "audio": c.audio}
+            {"id": c.id, "nombre": c.nombre, "dispositivo": c.dispositivo,
+             "dispositivo_nombre": c.dispositivo_nombre,
+             "audio": c.audio, "formato": c.formato}
             for c in self.camaras
         ]
         self._actualizar_config({
@@ -419,36 +436,44 @@ class Sesion:
             "modo_prueba": not any(c.configurada for c in self.camaras),
         })
 
-    def guardar_dispositivos(self, asignaciones: dict[str, str | None],
-                             audios: list[str] | None = None) -> None:
-        """Fija el dispositivo de video de cada camara y lo persiste.
+    def asignar_video(self, cam_id: str, dispositivo: dispositivos.Dispositivo | None,
+                      audios: list[dispositivos.Dispositivo] | None = None) -> None:
+        """Asigna el dispositivo de video de una camara y lo persiste.
 
-        'asignaciones' mapea id de camara -> nombre DirectShow de video, o None
-        para volver esa camara a modo prueba (testsrc2).
-
-        Al asignar un video se autoempareja su micro (por el sufijo '(<video>)')
-        usando 'audios', la lista de microfonos detectados. Si se quita el video
-        (None), tambien se quita el audio: no tiene sentido grabar solo el micro.
-        La eleccion manual de audio se hace aparte con guardar_audio().
+        'dispositivo' es un Dispositivo (id de hardware + nombre) o None para
+        volver la camara a modo prueba. Al asignar video se autoempareja su
+        micro; si se quita el video, tambien se quita el audio (no tiene sentido
+        grabar solo el micro). La eleccion manual de micro va en guardar_audio().
         """
         if audios is None:
             audios = dispositivos.listar_audio()
 
         for cam in self.camaras:
-            if cam.id not in asignaciones:
+            if cam.id != cam_id:
                 continue
-            cam.dispositivo = asignaciones[cam.id]
-            if cam.dispositivo:
-                cam.audio = dispositivos.emparejar_audio(cam.dispositivo, audios)
+            if dispositivo:
+                cam.dispositivo = dispositivo.id
+                cam.dispositivo_nombre = dispositivo.nombre
+                micro = dispositivos.emparejar_audio(dispositivo, audios)
+                cam.audio = micro.id if micro else None
             else:
+                cam.dispositivo = None
+                cam.dispositivo_nombre = None
                 cam.audio = None
         self._persistir_camaras()
 
     def guardar_audio(self, cam_id: str, audio: str | None) -> None:
-        """Fija manualmente el micro de una camara (o None para 'sin audio')."""
+        """Fija manualmente el micro de una camara (id/nombre, o None sin audio)."""
         for cam in self.camaras:
             if cam.id == cam_id:
                 cam.audio = audio
+        self._persistir_camaras()
+
+    def guardar_formato(self, cam_id: str, formato: str) -> None:
+        """Fija el formato de entrada de una camara: mjpeg | yuyv422 | auto."""
+        for cam in self.camaras:
+            if cam.id == cam_id:
+                cam.formato = formato
         self._persistir_camaras()
 
     @staticmethod
@@ -542,7 +567,9 @@ class Sesion:
                 {
                     "id": g.camara.id,
                     "nombre": g.camara.nombre,
+                    "dispositivo": g.camara.dispositivo_nombre,  # nombre legible
                     "audio": g.camara.audio,   # micro usado, o null si sin audio
+                    "formato": g.camara.formato if g.camara.configurada else None,
                     "fichero": g.estado.fichero.name if g.estado.fichero else None,
                     "frames": g.estado.frames,
                     # Un tamano de 0 delata una camara que no llego a grabar
@@ -561,7 +588,11 @@ class Sesion:
             json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
+        # La carpeta se anade al dict devuelto (no al JSON: es una ruta local que
+        # no tiene sentido subir a OneDrive). La usa la app para el mosaico.
+        resultado = dict(metadata, carpeta=str(info["carpeta"]))
+
         # Sesion queda libre para el siguiente asalto.
         self.asalto_actual = None
         self.grabadores = []
-        return metadata
+        return resultado
