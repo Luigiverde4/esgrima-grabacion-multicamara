@@ -25,8 +25,13 @@ y comprobando los ficheros resultantes con `ffprobe` (ver más abajo).
 Cuando `config.json` tiene todos los `camaras[].dispositivo` a `null`, la aplicación
 graba con el patrón sintético `testsrc2` en lugar de capturadoras. Esto permite
 desarrollar el flujo completo (asaltos, metadata, subida) sin hardware conectado.
-El botón "Detectar capturadoras" reescribe `config.json` asignando dispositivos
-reales; poner los valores a `null` de nuevo vuelve al modo prueba.
+
+Cada cámara tiene en la interfaz un desplegable (`ttk.Combobox`) que lista los
+dispositivos DirectShow detectados más la opción de modo prueba. La elección se
+guarda con `Sesion.guardar_dispositivos()`, que reescribe `config.json` releyéndolo
+antes (comparte helper `_actualizar_config` con el contador de asaltos). No hay
+filtro de dispositivos "virtuales": el operador decide, así que un móvil vía Iriun
+es una fuente válida si la elige.
 
 ## Arquitectura
 
@@ -36,8 +41,10 @@ Cuatro módulos, con la GUI desacoplada del motor:
   un proceso FFmpeg y publica su estado en `EstadoCamara`. No sabe nada de Tkinter.
 - `app.py` — GUI Tkinter. Hace polling de `EstadoCamara` cada 500 ms para pintar
   los semáforos; no recibe callbacks del motor.
-- `dispositivos.py` — enumeración DirectShow vía FFmpeg, y filtro de webcams
-  virtuales (Iriun, OBS Virtual…) que no son capturadoras reales.
+- `dispositivos.py` — enumeración DirectShow (vídeo y audio) vía FFmpeg,
+  emparejado micro↔cámara y previsualización con `ffplay`. No filtra
+  dispositivos: el operador elige en la interfaz, así que una webcam virtual es
+  una fuente válida si la selecciona.
 - `subida.py` — `rclone copy` en un hilo, con callbacks de progreso.
 
 **Un proceso FFmpeg independiente por cámara**, no uno con varias entradas. Si una
@@ -58,6 +65,10 @@ Estas decisiones tienen motivo y revertirlas causa fallos difíciles de ver:
   el cierre limpio escribe la duración en el contenedor. Por eso el proceso se lanza
   con `stdin=PIPE` y **sin** `-nostdin`. `terminate()` queda como plan B por timeout.
 - **`rclone copy`, nunca `sync`.** `sync` borraría en OneDrive.
+- **`--use-json-log` en la subida, no `--stats-one-line`.** El formato legible no
+  emite saltos de línea, así que leerlo línea a línea daba un progreso a
+  trompicones. El JSON trae además `transferring[].name`, que es lo que permite
+  mostrar qué asalto se está subiendo.
 - **`-re` en las entradas `lavfi`.** Sin él, `testsrc2` genera frames a velocidad de
   CPU y las duraciones grabadas no se corresponden con el tiempo real.
 - **Filtrado de ruido de FFmpeg** (`_RUIDO` en `grabador.py`). Avisos benignos como
@@ -65,6 +76,23 @@ Estas decisiones tienen motivo y revertirlas causa fallos difíciles de ver:
   añadir avisos nuevos a esa lista, comprobar que no enmascaran fallos reales.
 - **`_detencion_pedida`** distingue una parada nuestra de una caída real: FFmpeg
   sale con código distinto de cero de forma legítima cuando lo paramos nosotros.
+- **Una capturadora no admite dos procesos DirectShow a la vez.** Por eso la
+  previsualización (`ffplay`) se cierra al iniciar un asalto (`_cerrar_previews()`
+  en `_iniciar`) y el botón "Ver" se desactiva mientras se graba. Si se abre otra
+  vía de acceso al dispositivo, respetar esta exclusión.
+- **Emparejar micro por el sufijo `(<vídeo>)`, no por "contiene".** Las
+  capturadoras exponen su micro como `Microphone (USB Video #2)`. Buscar por
+  "contiene el nombre" cogería el micro equivocado con capturadoras idénticas
+  (`USB Video` es subcadena de `USB Video #2`). Ver `emparejar_audio` en
+  `dispositivos.py`.
+- **`-af aresample=async=1` al grabar audio dshow.** El reloj del audio HDMI
+  puede ir a distinta velocidad que el del vídeo; sin resampleo asíncrono, la
+  sincronía deriva a lo largo del asalto.
+- **Los objetos `Camara` son la fuente de verdad al persistir dispositivos.**
+  `_persistir_camaras()` reconstruye el bloque `camaras` de `config.json` desde
+  ellos, no al revés, para que vídeo y audio nunca se desincronicen. El campo
+  `audio` tiene default `None`, así que configs anteriores al cambio siguen
+  cargando sin romperse.
 
 ## Numeración de asaltos y estructura de carpetas
 

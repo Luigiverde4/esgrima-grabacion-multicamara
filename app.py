@@ -19,7 +19,6 @@ DOS FORMAS DE RECIBIR INFORMACION, Y POR QUE
     de forma intermitente y dificil de reproducir.
 """
 
-import json
 import subprocess
 import tkinter as tk
 from pathlib import Path
@@ -46,8 +45,13 @@ class App(tk.Tk):
         self.sesion = Sesion(CFG)   # motor: lee config.json y prepara camaras
         self.subiendo = False       # bloquea grabar y subir a la vez
         self._firma_lista = None    # evita repintar la lista sin cambios
+        self._previews: dict[str, subprocess.Popen] = {}  # ffplay por camara
+        self._video_disp: list[str] = []   # ultimo listado de dispositivos
+        self._audio_disp: list[str] = []
 
         self._construir()
+        # Rellena los desplegables una vez montada la interfaz (necesita el log).
+        self._refrescar_dispositivos()
         self._refrescar()           # arranca el ciclo de refresco permanente
         # Interceptar el cierre para no perder un asalto a medio grabar.
         self.protocol("WM_DELETE_WINDOW", self._al_cerrar)
@@ -98,23 +102,62 @@ class App(tk.Tk):
         mc = ttk.LabelFrame(cont, text="Camaras", padding=12)
         mc.pack(fill="x", pady=(0, 10))
 
-        # Una fila por camara: (punto de color, etiqueta de detalle).
-        # El orden coincide con self.sesion.camaras y con self.sesion.grabadores,
-        # y _refrescar() los empareja con zip().
+        # Texto que representa "sin dispositivo" en los desplegables. Se elige
+        # una cadena que ningun dispositivo real puede tener como nombre.
+        self.MODO_PRUEBA = "-- Modo prueba (patron) --"
+        self.SIN_AUDIO = "-- Sin audio --"
+
+        # Una fila (dos lineas) por camara. Cada fila guarda: punto de color,
+        # combo de video, combo de audio, etiqueta de estado y boton Ver. El
+        # orden coincide con self.sesion.camaras y con self.sesion.grabadores;
+        # _refrescar() los empareja con zip().
         self.filas = []
         for cam in self.sesion.camaras:
-            f = ttk.Frame(mc)
-            f.pack(fill="x", pady=3)
-            punto = tk.Label(f, text="●", font=("Segoe UI", 15), fg=GRIS)
-            punto.pack(side="left")
-            ttk.Label(f, text=f"{cam.id} - {cam.nombre}",
-                      font=("Segoe UI", 10), width=30, anchor="w").pack(side="left", padx=6)
-            info = ttk.Label(f, text="en espera", foreground=GRIS, font=("Segoe UI", 9))
-            info.pack(side="left", fill="x", expand=True)
-            self.filas.append((punto, info))
+            marco_cam = ttk.Frame(mc)
+            marco_cam.pack(fill="x", pady=(4, 8))
 
-        ttk.Button(mc, text="Detectar capturadoras",
-                   command=self._detectar).pack(anchor="w", pady=(8, 0))
+            # Linea superior: punto, nombre, combo de video, boton Ver.
+            arriba = ttk.Frame(marco_cam)
+            arriba.pack(fill="x")
+
+            punto = tk.Label(arriba, text="●", font=("Segoe UI", 15), fg=GRIS)
+            punto.pack(side="left")
+            ttk.Label(arriba, text=f"{cam.id} · {cam.nombre}",
+                      font=("Segoe UI", 10), width=22, anchor="w").pack(side="left", padx=(6, 8))
+
+            combo = ttk.Combobox(arriba, state="readonly", font=("Segoe UI", 9))
+            combo.pack(side="left", fill="x", expand=True)
+            # El id de camara se captura en la closure, no en un atributo del
+            # widget: asi el callback sabe a que camara aplica sin depender de
+            # atributos dinamicos.
+            combo.bind("<<ComboboxSelected>>",
+                       lambda _e, cid=cam.id, cb=combo: self._elegir_dispositivo(cid, cb))
+
+            ver = ttk.Button(arriba, text="Ver", width=5,
+                             command=lambda cid=cam.id: self._previsualizar(cid))
+            ver.pack(side="left", padx=(6, 0))
+
+            info = ttk.Label(arriba, text="", foreground=GRIS, font=("Segoe UI", 9))
+            info.pack(side="left", padx=(8, 0))
+
+            # Linea inferior: combo de audio (micro), alineado bajo el de video.
+            abajo = ttk.Frame(marco_cam)
+            abajo.pack(fill="x", pady=(3, 0))
+            ttk.Label(abajo, text="micro", foreground=GRIS, font=("Segoe UI", 8),
+                      width=22, anchor="e").pack(side="left", padx=(0, 8))
+            combo_audio = ttk.Combobox(abajo, state="readonly", font=("Segoe UI", 9))
+            combo_audio.pack(side="left", fill="x", expand=True)
+            combo_audio.bind("<<ComboboxSelected>>",
+                             lambda _e, cid=cam.id, cb=combo_audio: self._elegir_audio(cid, cb))
+
+            self.filas.append((punto, combo, combo_audio, info, ver))
+
+        pie = ttk.Frame(mc)
+        pie.pack(fill="x", pady=(8, 0))
+        ttk.Button(pie, text="↻ Refrescar lista",
+                   command=self._refrescar_dispositivos).pack(side="left")
+        self.lbl_disp = ttk.Label(pie, text="", foreground=GRIS, font=("Segoe UI", 9))
+        self.lbl_disp.pack(side="left", padx=10)
 
         # --- Subida ---
         ms = ttk.LabelFrame(cont, text="Subida a OneDrive", padding=12)
@@ -176,6 +219,9 @@ class App(tk.Tk):
             self._iniciar()
 
     def _iniciar(self) -> None:
+        # Cerrar las previews primero: DirectShow no deja que ffplay y FFmpeg
+        # abran la misma capturadora a la vez, y la grabacion fallaria.
+        self._cerrar_previews()
         try:
             info = self.sesion.iniciar_asalto(self.entrada.get().strip())
         except Exception as e:
@@ -226,53 +272,139 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ dispositivos
 
-    def _detectar(self) -> None:
-        """Busca capturadoras y las escribe en config.json.
+    def _refrescar_dispositivos(self) -> None:
+        """Rellena cada desplegable con los dispositivos conectados ahora.
 
-        Asigna por orden de aparicion, que es el del sistema y no tiene por que
-        coincidir con la posicion en la pista. Por eso se avisa de revisarlo:
-        confundir el POV frontal con un lateral estropea todo el material.
+        La opcion de modo prueba va siempre la primera. Se conserva la eleccion
+        guardada de cada camara aunque su dispositivo no este conectado en este
+        momento: asi no se pierde la configuracion si se refresca con un cable
+        suelto (se marca como no disponible, pero no se borra).
         """
-        nombres = dispositivos.listar_camaras()
-        if not nombres:
-            messagebox.showwarning("Sin dispositivos", "No se ha detectado ninguna camara.")
+        if self.sesion.grabando:
+            return  # no cambiar dispositivos con una grabacion en curso
+
+        # Video y audio en una sola llamada a FFmpeg, y en memoria para que
+        # _elegir_dispositivo pueda autoemparejar sin volver a enumerar.
+        self._video_disp, self._audio_disp = dispositivos.listar_video_y_audio()
+        self.lbl_disp.configure(
+            text=(f"{len(self._video_disp)} video · {len(self._audio_disp)} audio"
+                  if self._video_disp else "ningun dispositivo detectado")
+        )
+        self._escribir(f"Detectados: {len(self._video_disp)} video, "
+                       f"{len(self._audio_disp)} audio")
+
+        for (_punto, combo, combo_audio, _info, _ver), cam in zip(
+                self.filas, self.sesion.camaras):
+            self._rellenar_combo_video(combo, cam)
+            self._rellenar_combo_audio(combo_audio, cam)
+
+    def _rellenar_combo_video(self, combo: ttk.Combobox, cam) -> None:
+        """Opciones y valor del desplegable de video de una camara."""
+        opciones = [self.MODO_PRUEBA] + self._video_disp
+        # Un dispositivo guardado que ya no aparece se conserva como opcion para
+        # no perder la seleccion; se muestra marcado como no disponible.
+        if cam.dispositivo and cam.dispositivo not in self._video_disp:
+            opciones.append(f"{cam.dispositivo}  (no disponible)")
+        combo.configure(values=opciones)
+        combo.set(self._texto_dispositivo(cam.dispositivo, self._video_disp,
+                                          self.MODO_PRUEBA))
+
+    def _rellenar_combo_audio(self, combo: ttk.Combobox, cam) -> None:
+        """Opciones y valor del desplegable de audio (micro) de una camara.
+
+        En modo prueba el audio no aplica: el combo queda deshabilitado.
+        """
+        if not cam.configurada:
+            combo.configure(values=[self.SIN_AUDIO], state="disabled")
+            combo.set(self.SIN_AUDIO)
             return
 
-        # Iriun, OBS Virtual y similares aparecen como camaras pero no lo son.
-        # Sin este aviso, se asignarian creyendo tener las capturadoras puestas.
-        if dispositivos.son_virtuales(nombres):
+        opciones = [self.SIN_AUDIO] + self._audio_disp
+        if cam.audio and cam.audio not in self._audio_disp:
+            opciones.append(f"{cam.audio}  (no disponible)")
+        combo.configure(values=opciones, state="readonly")
+        combo.set(self._texto_dispositivo(cam.audio, self._audio_disp,
+                                          self.SIN_AUDIO))
+
+    @staticmethod
+    def _texto_dispositivo(elegido: str | None, disponibles: list[str],
+                           vacio: str) -> str:
+        """Texto a mostrar en un desplegable segun lo elegido este o no conectado."""
+        if not elegido:
+            return vacio
+        if elegido in disponibles:
+            return elegido
+        return f"{elegido}  (no disponible)"
+
+    def _elegir_dispositivo(self, cam_id: str, combo: ttk.Combobox) -> None:
+        """Guarda la eleccion de video; el micro se autoempareja."""
+        if self.sesion.grabando:
+            return
+        texto = combo.get()
+        if texto == self.MODO_PRUEBA:
+            dispositivo = None
+        else:
+            dispositivo = texto.split("  (no disponible)")[0]
+
+        # Al asignar video se autoempareja el micro por el sufijo '(<video>)'.
+        self.sesion.guardar_dispositivos({cam_id: dispositivo}, self._audio_disp)
+        cam = next(c for c in self.sesion.camaras if c.id == cam_id)
+        self._escribir(f"{cam_id} -> {dispositivo or 'modo prueba'}"
+                       + (f"  ·  micro: {cam.audio}" if cam.audio else ""))
+        # Refleja el micro autoemparejado en su combo.
+        self._refrescar_dispositivos()
+
+    def _elegir_audio(self, cam_id: str, combo: ttk.Combobox) -> None:
+        """Guarda el micro elegido a mano para una camara."""
+        if self.sesion.grabando:
+            return
+        texto = combo.get()
+        if texto == self.SIN_AUDIO:
+            audio = None
+        else:
+            audio = texto.split("  (no disponible)")[0]
+        self.sesion.guardar_audio(cam_id, audio)
+        self._escribir(f"{cam_id} · micro -> {audio or 'sin audio'}")
+
+    def _previsualizar(self, cam_id: str) -> None:
+        """Abre (o cierra) una ventana de ffplay con la imagen en vivo.
+
+        Si ya hay una preview de esa camara abierta, el boton la cierra: asi el
+        mismo boton sirve para abrir y quitar. No funciona en modo prueba (no
+        hay dispositivo real que mostrar) ni durante la grabacion.
+        """
+        # Si la preview anterior sigue viva, este segundo clic la cierra.
+        proc = self._previews.get(cam_id)
+        if proc and proc.poll() is None:
+            proc.terminate()
+            self._previews.pop(cam_id, None)
+            self._escribir(f"{cam_id} -> previsualizacion cerrada")
+            return
+
+        cam = next((c for c in self.sesion.camaras if c.id == cam_id), None)
+        if not cam or not cam.dispositivo:
             messagebox.showinfo(
-                "Solo camaras virtuales",
-                "Lo detectado son webcams virtuales, no capturadoras:\n\n"
-                + "\n".join(f"- {n}" for n in nombres)
-                + "\n\nConecta las capturadoras HDMI y vuelve a detectar."
+                "Sin dispositivo",
+                "Esta camara esta en modo prueba.\n\n"
+                "Elige una capturadora en el desplegable para previsualizarla."
             )
             return
 
-        self._escribir(f"Detectadas {len(nombres)} camaras:")
-        for n in nombres:
-            self._escribir(f"    - {n}")
+        v = self.sesion.cfg["video"]
+        proc = dispositivos.previsualizar(cam.dispositivo, v["resolucion"], v["fps"])
+        if proc is None:
+            messagebox.showerror("Error", "No se encontro ffplay en el PATH.")
+            return
 
-        # Se relee el fichero en vez de usar self.sesion.cfg para no perder
-        # ajustes que se hayan editado a mano mientras la aplicacion corria.
-        cfg = json.loads(CFG.read_text(encoding="utf-8"))
-        asignadas = 0
-        for i, cam in enumerate(cfg["camaras"]):
-            if i < len(nombres):   # con menos camaras que ranuras, el resto sigue en None
-                cam["dispositivo"] = nombres[i]
-                asignadas += 1
-        cfg["modo_prueba"] = asignadas == 0
-        CFG.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._previews[cam_id] = proc
+        self._escribir(f"{cam_id} -> previsualizando {cam.dispositivo}")
 
-        # Sesion nueva para que tome los dispositivos recien asignados.
-        self.sesion = Sesion(CFG)
-        self._escribir(f"Asignadas {asignadas} camaras. Revisa el orden en config.json.")
-        messagebox.showinfo(
-            "Camaras asignadas",
-            f"Se han asignado {asignadas} camaras.\n\n"
-            "Comprueba que el orden coincide con la posicion real en la pista; "
-            "si no, cambialo en config.json."
-        )
+    def _cerrar_previews(self) -> None:
+        """Cierra todas las ventanas de previsualizacion abiertas."""
+        for proc in self._previews.values():
+            if proc.poll() is None:
+                proc.terminate()
+        self._previews.clear()
 
     # ---------------------------------------------------------------- subida
 
@@ -403,10 +535,12 @@ class App(tk.Tk):
         """
         # Aviso permanente de modo prueba: grabar un asalto real creyendo tener
         # las capturadoras puestas, y acabar con tres patrones de barras, seria
-        # una perdida irrecuperable.
+        # una perdida irrecuperable. En el otro caso solo se afirma que hay
+        # dispositivo asignado, no que este dando senal: eso lo dicen los
+        # semaforos durante la grabacion.
         prueba = not any(c.configurada for c in self.sesion.camaras)
         self.lbl_modo.configure(
-            text="MODO PRUEBA (testsrc)" if prueba else "Capturadoras conectadas",
+            text="MODO PRUEBA (testsrc)" if prueba else "Dispositivos asignados",
             foreground=AMBAR if prueba else VERDE,
         )
 
@@ -414,8 +548,13 @@ class App(tk.Tk):
             info = self.sesion.asalto_actual
             # zip empareja fila i con grabador i: ambas listas siguen el orden
             # de config.json.
-            for (punto, lbl), g in zip(self.filas, self.sesion.grabadores):
+            for (punto, combo, combo_audio, lbl, ver), g in zip(
+                    self.filas, self.sesion.grabadores):
+                combo.configure(state="disabled")        # no cambiar fuente al vuelo
+                combo_audio.configure(state="disabled")
+                ver.configure(state="disabled")          # no previsualizar mientras graba
                 e = g.estado
+                sufijo_audio = " ♪" if g.camara.con_audio else ""
                 # Orden de prioridad: primero lo mas grave.
                 if e.error:
                     punto.configure(fg=ROJO)
@@ -429,7 +568,7 @@ class App(tk.Tk):
                     punto.configure(fg=VERDE)
                     mb = (e.fichero.stat().st_size / 1e6
                           if e.fichero and e.fichero.exists() else 0)
-                    lbl.configure(text=f"grabando - {e.frames} frames - {mb:.0f} MB",
+                    lbl.configure(text=f"grabando - {e.frames} frames - {mb:.0f} MB{sufijo_audio}",
                                   foreground=VERDE)
                 else:
                     # Proceso terminado sin error registrado: no deberia pasar
@@ -440,10 +579,17 @@ class App(tk.Tk):
                 text=f"Asalto {info['numero']:03d} en curso  -  {info['jornada']}"
             )
         else:
-            # En reposo: todo gris y se anuncia el numero del proximo asalto.
-            for punto, lbl in self.filas:
-                punto.configure(fg=GRIS)
-                lbl.configure(text="en espera", foreground=GRIS)
+            # En reposo: el punto refleja si la camara tiene fuente asignada
+            # (verde apagado) o esta en modo prueba (gris). El combo vuelve a
+            # ser seleccionable y la etiqueta de estado se limpia.
+            for (punto, combo, combo_audio, lbl, ver), cam in zip(
+                    self.filas, self.sesion.camaras):
+                punto.configure(fg=VERDE if cam.configurada else GRIS)
+                combo.configure(state="readonly")
+                # El combo de audio solo tiene sentido con video real.
+                combo_audio.configure(state="readonly" if cam.configurada else "disabled")
+                ver.configure(state="normal")
+                lbl.configure(text="")
             n = self.sesion.siguiente_numero()
             self.lbl_asalto.configure(
                 text=f"Listo - siguiente: asalto {n:03d}  -  {self.sesion.carpeta_dia()}"
@@ -471,6 +617,7 @@ class App(tk.Tk):
         if self.subiendo and not messagebox.askyesno(
                 "Subida en curso", "La subida no ha terminado. Salir igualmente?"):
             return
+        self._cerrar_previews()  # no dejar ventanas de ffplay huerfanas
         self.destroy()
 
 

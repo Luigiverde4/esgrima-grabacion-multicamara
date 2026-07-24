@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+import dispositivos
+
 # En Windows, evita que se abra una ventana de consola por cada FFmpeg.
 _SIN_VENTANA = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
 
@@ -37,12 +39,18 @@ class Camara:
     """Una camara tal y como esta declarada en config.json."""
     id: str                          # identifica el fichero: cam1.mkv
     nombre: str                      # descripcion para el operador: "Frontal"
-    dispositivo: str | None = None   # nombre DirectShow; None => modo prueba
+    dispositivo: str | None = None   # nombre DirectShow de video; None => modo prueba
+    audio: str | None = None         # micro DirectShow; None => graba sin audio
 
     @property
     def configurada(self) -> bool:
         """False mientras no haya capturadora asignada (se usara testsrc2)."""
         return bool(self.dispositivo)
+
+    @property
+    def con_audio(self) -> bool:
+        """True si hay micro asignado. Solo tiene efecto con video real."""
+        return self.configurada and bool(self.audio)
 
 
 @dataclass
@@ -127,19 +135,24 @@ class GrabadorCamara:
             # velocidad de la CPU y la duracion grabada no coincide con la real.
             return ["-re", "-f", "lavfi", "-i", fuente]
 
-        # Capturadora real via DirectShow.
+        # Capturadora real via DirectShow. Si hay micro asignado, se captura en
+        # el mismo -i con la sintaxis 'video=X:audio=Y'; el separador ':' es
+        # seguro porque los nombres DirectShow no lo contienen.
+        especificador = f"video={self.camara.dispositivo}"
+        if self.camara.con_audio:
+            especificador += f":audio={self.camara.audio}"
         return [
             "-f", "dshow",
             "-rtbufsize", "256M",          # colchon ante microcortes USB
             "-video_size", v["resolucion"],
             "-framerate", str(v["fps"]),
-            "-i", f"video={self.camara.dispositivo}",
+            "-i", especificador,
         ]
 
     def comando(self, destino: Path) -> list[str]:
         """Construye la linea de FFmpeg completa para esta camara."""
         v = self.cfg["video"]
-        return [
+        cmd = [
             # OJO: nada de -nostdin. Necesitamos el stdin abierto para enviar
             # 'q' al parar; es lo unico que hace que FFmpeg cierre el MKV
             # escribiendo la duracion. Ver detener().
@@ -151,17 +164,28 @@ class GrabadorCamara:
 
             *self._entrada(),               # testsrc2 o capturadora, segun config
 
-            "-an",                          # sin audio, de momento
             "-c:v", "libx264",
             "-preset", v["preset"],
             "-crf", str(v["crf"]),
             "-pix_fmt", "yuv420p",          # compatibilidad de reproduccion
             "-g", str(v["fps"] * 2),        # keyframe cada 2s, facilita recortes
-
-            # El contenedor lo decide la extension .mkv del destino: elegido
-            # porque sobrevive a un corte de luz. Un MP4 quedaria inservible.
-            "-y", str(destino),
         ]
+
+        if self.camara.con_audio:
+            cmd += [
+                "-c:a", "aac", "-b:a", "160k",
+                # El reloj del audio HDMI puede ir a distinta velocidad que el
+                # del video; sin resampleo asincrono, la sincronia deriva a lo
+                # largo de un asalto largo. aresample=async=1 lo compensa.
+                "-af", "aresample=async=1",
+            ]
+        else:
+            cmd.append("-an")               # sin audio (modo prueba o sin micro)
+
+        # El contenedor lo decide la extension .mkv del destino: elegido porque
+        # sobrevive a un corte de luz. Un MP4 quedaria inservible.
+        cmd += ["-y", str(destino)]
+        return cmd
 
     def iniciar(self, carpeta: Path) -> None:
         """Lanza FFmpeg y el hilo que vigila su salida. No bloquea."""
@@ -353,26 +377,79 @@ class Sesion:
                     maximo = max(maximo, int(m.group(1)))
         return maximo
 
-    def _guardar_contador(self, numero: int) -> None:
-        """Anota en config.json el ultimo numero usado.
+    def _actualizar_config(self, cambios: dict) -> None:
+        """Aplica 'cambios' a config.json releyendolo antes de escribir.
 
-        Se relee el fichero antes de escribir para no pisar cambios hechos a
-        mano (o por 'Detectar capturadoras') mientras la aplicacion corria.
+        Releer evita pisar otros ajustes que se hayan tocado (a mano o desde
+        otra parte de la app) mientras esta instancia estaba viva. Los cambios
+        se reflejan tambien en self.cfg para no tener que recargar la sesion.
         """
         try:
             datos = json.loads(self.ruta_cfg.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            datos = self.cfg
-        datos["ultimo_asalto"] = numero
-        self.cfg["ultimo_asalto"] = numero
+            datos = dict(self.cfg)
+        datos.update(cambios)
+        self.cfg.update(cambios)
         try:
             self.ruta_cfg.write_text(
                 json.dumps(datos, indent=2, ensure_ascii=False), encoding="utf-8"
             )
         except OSError:
-            # Si no se puede escribir (fichero bloqueado, disco lleno), la
-            # grabacion no debe detenerse: _maximo_en_disco() cubre el hueco.
+            # Si no se puede escribir (fichero bloqueado, disco lleno), no se
+            # interrumpe: para el contador, _maximo_en_disco() cubre el hueco.
             pass
+
+    def _guardar_contador(self, numero: int) -> None:
+        """Anota en config.json el ultimo numero de asalto usado."""
+        self._actualizar_config({"ultimo_asalto": numero})
+
+    def _persistir_camaras(self) -> None:
+        """Vuelca el estado de los objetos Camara vivos a config.json.
+
+        Los Camara son la fuente de verdad: el dict de config se reconstruye a
+        partir de ellos, no al reves. Asi video y audio nunca se desincronizan.
+        """
+        camaras = [
+            {"id": c.id, "nombre": c.nombre,
+             "dispositivo": c.dispositivo, "audio": c.audio}
+            for c in self.camaras
+        ]
+        self._actualizar_config({
+            "camaras": camaras,
+            "modo_prueba": not any(c.configurada for c in self.camaras),
+        })
+
+    def guardar_dispositivos(self, asignaciones: dict[str, str | None],
+                             audios: list[str] | None = None) -> None:
+        """Fija el dispositivo de video de cada camara y lo persiste.
+
+        'asignaciones' mapea id de camara -> nombre DirectShow de video, o None
+        para volver esa camara a modo prueba (testsrc2).
+
+        Al asignar un video se autoempareja su micro (por el sufijo '(<video>)')
+        usando 'audios', la lista de microfonos detectados. Si se quita el video
+        (None), tambien se quita el audio: no tiene sentido grabar solo el micro.
+        La eleccion manual de audio se hace aparte con guardar_audio().
+        """
+        if audios is None:
+            audios = dispositivos.listar_audio()
+
+        for cam in self.camaras:
+            if cam.id not in asignaciones:
+                continue
+            cam.dispositivo = asignaciones[cam.id]
+            if cam.dispositivo:
+                cam.audio = dispositivos.emparejar_audio(cam.dispositivo, audios)
+            else:
+                cam.audio = None
+        self._persistir_camaras()
+
+    def guardar_audio(self, cam_id: str, audio: str | None) -> None:
+        """Fija manualmente el micro de una camara (o None para 'sin audio')."""
+        for cam in self.camaras:
+            if cam.id == cam_id:
+                cam.audio = audio
+        self._persistir_camaras()
 
     @staticmethod
     def _limpiar(texto: str) -> str:
@@ -465,6 +542,7 @@ class Sesion:
                 {
                     "id": g.camara.id,
                     "nombre": g.camara.nombre,
+                    "audio": g.camara.audio,   # micro usado, o null si sin audio
                     "fichero": g.estado.fichero.name if g.estado.fichero else None,
                     "frames": g.estado.frames,
                     # Un tamano de 0 delata una camara que no llego a grabar

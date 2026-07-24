@@ -22,6 +22,10 @@ Durante la grabación, cada cámara muestra un indicador:
 | Ámbar | Sin señal — imagen congelada (revisar cable HDMI) |
 | Rojo  | Cámara caída |
 
+En el recuadro de subida se listan los asaltos grabados con su tamaño, y se
+marca con `>` el que se está transfiriendo. La barra y el detalle (MB, ficheros,
+velocidad, tiempo restante) se actualizan cada segundo.
+
 ## Estructura resultante
 
 Se replica tal cual en `personal:ESGRIMA_26`:
@@ -62,12 +66,31 @@ numeración no retrocede sobre material ya grabado.
   técnica; subir a 60 fps triplica el tamaño y rara vez aporta.
 - `video.crf` — 21 es calidad alta. Subir el número reduce tamaño y calidad.
 - `camaras[].dispositivo` — `null` activa el modo prueba (patrón `testsrc2`,
-  sin necesidad de hardware). Se rellena con **Detectar capturadoras**.
+  sin necesidad de hardware). Se elige desde la interfaz con el desplegable de
+  cada cámara; la elección se guarda aquí y persiste entre sesiones.
 - `rclone_destino` — `personal:ESGRIMA_26`.
 
-Tras detectar las capturadoras, **verificar que el orden coincide con la posición
-real en la pista**; FFmpeg las enumera por orden del sistema, no por ubicación.
-Si no coincide, reordenar los nombres en `config.json`.
+En el recuadro **Cámaras**, cada fila tiene un desplegable para elegir su
+dispositivo (o dejarla en modo prueba) y un botón **Ver** que abre una ventana
+con la imagen en vivo (útil para ajustar el encuadre). El botón **↻ Refrescar
+lista** vuelve a consultar lo conectado. Al asignar, **comprobar que cada cámara
+apunta a la posición correcta en la pista**: confundir el POV frontal con un
+lateral estropea el material de toda la jornada. Un dispositivo elegido que luego
+se desconecta se marca como *(no disponible)* pero no se pierde la configuración.
+
+La previsualización usa `ffplay` en una ventana aparte de 640×360 (16:9), para
+no tapar la aplicación. No se puede previsualizar y grabar la misma capturadora a
+la vez (DirectShow lo impide), así que al iniciar un asalto las previews se
+cierran solas y el botón se desactiva mientras se graba.
+
+### Audio
+
+Cada cámara HDMI trae su propio micro. Al elegir una capturadora, su micro se
+**autoempareja** por el nombre entre paréntesis (`USB Video #2` →
+`Microphone (USB Video #2)`), lo que funciona incluso con varias capturadoras
+idénticas. El segundo desplegable (**micro**) de cada cámara permite cambiarlo a
+mano o ponerlo en *sin audio*. El audio se graba en el mismo MKV, en AAC. Durante
+la grabación, las cámaras con audio muestran un ♪.
 
 ## Decisiones de diseño
 
@@ -84,8 +107,9 @@ Si no coincide, reordenar los nombres en `config.json`.
 
 ## Pendiente
 
-- Audio (previsto para más adelante).
-- Previsualización en vivo de los tres POVs (requeriría MediaMTX).
+- Previsualización simultánea de los tres POVs empotrada en la interfaz
+  (la actual abre una ventana `ffplay` por cámara; lo simultáneo requeriría
+  MediaMTX).
 
 ## Notas originales
 
