@@ -79,11 +79,6 @@ def _extraer(tipo: str, salida: str) -> list[Dispositivo]:
     return dispositivos
 
 
-def listar_dispositivos() -> list[Dispositivo]:
-    """Dispositivos de video conectados, con su id de hardware."""
-    return _extraer("video", _enumerar())
-
-
 def listar_audio() -> list[Dispositivo]:
     """Dispositivos de audio (microfonos) conectados, con su id de hardware."""
     return _extraer("audio", _enumerar())

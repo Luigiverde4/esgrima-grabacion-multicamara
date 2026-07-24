@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Grabaciones: material de trabajo, no va al control de versiones.
+# Las graba la app y se suben a OneDrive con rclone.
+grabaciones/
+
+# Registros de sesion (un .txt por arranque de la app).
+logs/
+
+# Artefactos temporales del mosaico (por si queda alguno huerfano tras un corte).
+_mosaico.bat
+mosaico.parcial.mkv
+
+# Binarios reservados de MediaMTX (aun sin usar; no versionar el ejecutable).
+mediamtx.exe
+
+# Sistema operativo
+Thumbs.db
+desktop.ini
+.DS_Store

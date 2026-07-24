@@ -1,0 +1,25 @@
+[project]
+name = "esgrima"
+version = "2026.0"
+description = "Control de grabacion multicamara de asaltos de esgrima, con mosaico y subida a OneDrive."
+requires-python = ">=3.11"
+
+# Sin dependencias de Python: el proyecto usa solo la biblioteca estandar
+# (Tkinter incluido). Por eso 'dependencies' esta vacio a proposito.
+dependencies = []
+
+# Las dependencias REALES no son paquetes de Python, sino ejecutables que
+# deben estar en el PATH. pip/pyproject no los instala; se documentan aqui:
+#
+#   ffmpeg   grabacion y composicion del mosaico
+#   ffprobe  verificacion de las grabaciones
+#   ffplay   previsualizacion en vivo de cada camara
+#   rclone   subida a OneDrive
+#
+# En Windows se instalan aparte (p.ej. winget install Gyan.FFmpeg Rclone.Rclone)
+# y deben quedar accesibles desde la linea de comandos.
+
+[project.scripts]
+# Punto de entrada: 'python app.py' sigue funcionando; esto es solo la
+# declaracion formal por si se empaqueta.
+esgrima = "app:main"

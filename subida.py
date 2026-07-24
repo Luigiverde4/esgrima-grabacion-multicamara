@@ -64,7 +64,8 @@ def _asalto_de(ruta: str) -> str:
 
 def subir(origen: Path, destino: str,
           al_avanzar: Callable[[Progreso], None],
-          al_terminar: Callable[[bool, str], None]) -> threading.Thread:
+          al_terminar: Callable[[bool, str], None],
+          carpetas: list[Path] | None = None) -> threading.Thread:
     """Copia 'origen' a 'destino' en segundo plano.
 
     al_avanzar(progreso)     se llama ~1 vez por segundo mientras dure.
@@ -72,9 +73,26 @@ def subir(origen: Path, destino: str,
 
     Ambos se ejecutan en el hilo de rclone, no en el de quien llama.
 
+    'carpetas' limita la subida a esos asaltos concretos (subida selectiva). Si
+    es None (o vacia), se sube 'origen' entero. Se implementa con --include sobre
+    la ruta relativa de cada carpeta, no copiando cada una por separado: asi se
+    conserva la estructura JORNADA/ASALTO en destino y basta un solo rclone (una
+    sola barra de progreso, un solo --transfers compartido).
+
     Se usa 'copy' y NUNCA 'sync': sync borraria en OneDrive todo lo que no
     exista en local, que aqui equivaldria a destruir grabaciones ya subidas.
     """
+
+    # Filtros --include con la ruta relativa de cada carpeta seleccionada. La
+    # ruta se pasa con '/' (rclone usa '/' en sus patrones aun en Windows) y con
+    # '/**' para incluir todo su contenido.
+    incluye: list[str] = []
+    for c in (carpetas or []):
+        try:
+            rel = c.relative_to(origen).as_posix()
+        except ValueError:
+            continue  # una carpeta fuera de 'origen' no se puede incluir; se ignora
+        incluye += ["--include", f"{rel}/**"]
 
     def tarea() -> None:
         cmd = [
@@ -91,6 +109,12 @@ def subir(origen: Path, destino: str,
             # instancia de la aplicacion ni una subida lanzada desde fuera.
             # --min-age deja fuera todo lo modificado en los ultimos 30 s.
             "--min-age", "30s",
+
+            # El fichero .subido es una marca LOCAL de estado (la escribe la app
+            # al subir con exito); no tiene sentido en OneDrive, se excluye.
+            "--exclude", ".subido",
+
+            *incluye,                    # vacio => sube todo; si no, solo lo elegido
         ]
         try:
             proc = subprocess.Popen(

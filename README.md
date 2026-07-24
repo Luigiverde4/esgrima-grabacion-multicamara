@@ -64,7 +64,12 @@ numeración no retrocede sobre material ya grabado.
 
 - `video.resolucion` / `video.fps` — 1080p30 por defecto. Suficiente para revisión
   técnica; subir a 60 fps triplica el tamaño y rara vez aporta.
-- `video.crf` — 21 es calidad alta. Subir el número reduce tamaño y calidad.
+- `video.preset` — `medium` por defecto: mejor compresión (ficheros más pequeños)
+  a igual calidad. El equipo (Ryzen 7, 16 hilos) codifica las tres cámaras a la
+  vez con margen de sobra. Si algún equipo más flojo se quedara corto de CPU en
+  directo, `fast` o `veryfast` alivian a costa de ficheros algo mayores.
+- `video.crf` — 22 es calidad alta (menor número = más calidad y más tamaño).
+  Independiente del preset: el crf fija cómo se ve, el preset cuánto ocupa.
 - `camaras[].dispositivo` — `null` activa el modo prueba (patrón `testsrc2`,
   sin necesidad de hardware). Se elige desde la interfaz con el desplegable de
   cada cámara; la elección se guarda aquí y persiste entre sesiones.
@@ -104,6 +109,16 @@ la grabación, las cámaras con audio muestran un ♪.
 - **`--min-age 30s` en la subida.** rclone falla al copiar un fichero que está
   creciendo. El botón ya se bloquea mientras se graba, pero esto cubre además
   una segunda instancia abierta o una subida lanzada desde la consola.
+
+## Documentación técnica
+
+Este README es la guía del operador. La documentación para desarrollar sobre el
+proyecto está en [docs/](docs/):
+
+- [Arquitectura](docs/ARQUITECTURA.md) · [Convenciones](docs/CONVENCIONES.md) ·
+  [Decisiones e invariantes](docs/DECISIONES.md)
+- [Glosario](docs/GLOSARIO.md) · [Flujo de trabajo](docs/FLUJO_DE_TRABAJO.md) ·
+  [Errores conocidos](docs/ERRORES_CONOCIDOS.md)
 
 ## Pendiente
 

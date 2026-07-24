@@ -21,6 +21,7 @@ DOS FORMAS DE RECIBIR INFORMACION, Y POR QUE
 
 import subprocess
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
 
@@ -31,6 +32,8 @@ from grabador import Sesion
 
 RAIZ = Path(__file__).parent
 CFG = RAIZ / "config.json"
+# Carpeta de registros: un fichero .txt por sesion (cada arranque de la app).
+LOGS = RAIZ / "logs"
 
 # Colores de estado, pensados para leerse de un vistazo desde lejos.
 VERDE, ROJO, AMBAR, GRIS = "#1a7f37", "#c9252d", "#bf8700", "#57606a"
@@ -39,20 +42,27 @@ VERDE, ROJO, AMBAR, GRIS = "#1a7f37", "#c9252d", "#bf8700", "#57606a"
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("ESGRIMA_26 - Grabacion de asaltos")
-        self.geometry("760x600")
-        self.minsize(680, 560)
+        self.title("Grabacion de asaltos")
+        # Alto suficiente para ver Asalto + Camaras + Subida sin maximizar.
+        self.geometry("820x700")
+        self.minsize(720, 640)
 
         self.sesion = Sesion(CFG)   # motor: lee config.json y prepara camaras
         self.subiendo = False       # bloquea grabar y subir a la vez
         self._firma_lista = None    # evita repintar la lista sin cambios
+        self._asaltos_lista: list = []  # posicion en el Listbox -> carpeta de asalto
+        self._subiendo_carpetas: list = []  # carpetas de la subida en curso
         self._previews: dict[str, subprocess.Popen] = {}  # ffplay por camara
         self._video_disp: list = []   # ultimo listado de Dispositivo (video)
         self._audio_disp: list = []   # ultimo listado de Dispositivo (audio)
         self._map_video: dict = {}    # etiqueta visible -> Dispositivo
         self._map_audio: dict = {}
+        self._fichero_log = self._abrir_log()  # .txt de esta sesion, o None
 
         self._construir()
+        # Cabecera de sesion en el registro: la fecha completa (en pantalla y en
+        # el .txt cada linea lleva solo la hora, asi el fichero queda fechado).
+        self._escribir(f"=== Sesion iniciada {datetime.now():%Y-%m-%d %H:%M} ===")
         # Rellena los desplegables una vez montada la interfaz (necesita el log).
         self._refrescar_dispositivos()
         self._refrescar()           # arranca el ciclo de refresco permanente
@@ -70,7 +80,7 @@ class App(tk.Tk):
 
         cab = ttk.Frame(cont)
         cab.pack(fill="x", pady=(0, 10))
-        ttk.Label(cab, text="ESGRIMA_26", font=("Segoe UI", 17, "bold")).pack(side="left")
+        ttk.Label(cab, text="Grabacion de asaltos", font=("Segoe UI", 17, "bold")).pack(side="left")
         self.lbl_modo = ttk.Label(cab, font=("Segoe UI", 9))
         self.lbl_modo.pack(side="right")
 
@@ -173,27 +183,35 @@ class App(tk.Tk):
         self.lbl_disp.pack(side="left", padx=10)
 
         # --- Subida ---
+        # Con el registro fuera, esta seccion absorbe el espacio sobrante: su
+        # lista de asaltos crece y se ven mas sin scroll.
         ms = ttk.LabelFrame(cont, text="Subida a OneDrive", padding=12)
-        ms.pack(fill="x", pady=(0, 10))
+        ms.pack(fill="both", expand=True, pady=(0, 10))
 
         f = ttk.Frame(ms)
         f.pack(fill="x")
         self.btn_subir = ttk.Button(f, text="Subir todo a OneDrive", command=self._subir)
         self.btn_subir.pack(side="left")
+        # Sube solo los asaltos marcados en la lista (Ctrl/Shift+clic). Arranca
+        # deshabilitado: se activa cuando hay seleccion (ver _actualizar_btn_sel).
+        self.btn_subir_sel = ttk.Button(f, text="Subir seleccionados",
+                                        command=self._subir_seleccionados, state="disabled")
+        self.btn_subir_sel.pack(side="left", padx=6)
         ttk.Button(f, text="Abrir carpeta local",
                    command=self._abrir_carpeta).pack(side="left", padx=6)
-        ttk.Label(f, text=self.sesion.cfg["rclone_destino"],
-                  foreground=GRIS, font=("Segoe UI", 9)).pack(side="right")
 
-        # Lista de asaltos pendientes de subir. Se rellena en _refrescar() y
-        # durante la subida marca cual se esta transfiriendo en cada momento.
+        # Lista de asaltos. Se rellena en _refrescar(); durante la subida marca
+        # con '>' el que se transfiere. selectmode extended: Ctrl/Shift+clic para
+        # elegir varios y subir solo esos.
         flista = ttk.Frame(ms)
-        flista.pack(fill="x", pady=(8, 0))
+        flista.pack(fill="both", expand=True, pady=(8, 0))
         self.lista = tk.Listbox(
             flista, height=5, font=("Consolas", 9), relief="flat",
-            activestyle="none", highlightthickness=0,
+            activestyle="none", highlightthickness=0, selectmode="extended",
             selectbackground="#dbeafe", selectforeground="#111",
         )
+        # Al cambiar la seleccion, habilita/deshabilita "Subir seleccionados".
+        self.lista.bind("<<ListboxSelect>>", lambda _e: self._actualizar_btn_sel())
         barra_lat = ttk.Scrollbar(flista, orient="vertical", command=self.lista.yview)
         self.lista.configure(yscrollcommand=barra_lat.set)
         self.lista.pack(side="left", fill="both", expand=True)
@@ -204,23 +222,38 @@ class App(tk.Tk):
         self.lbl_subida = ttk.Label(ms, text="", foreground=GRIS, font=("Segoe UI", 9))
         self.lbl_subida.pack(anchor="w")
 
-        # --- Registro ---
-        mr = ttk.LabelFrame(cont, text="Registro", padding=8)
-        mr.pack(fill="both", expand=True)
-        self.log = tk.Text(mr, height=6, font=("Consolas", 9),
-                           state="disabled", wrap="word", relief="flat")
-        self.log.pack(fill="both", expand=True)
+        # El registro ya no se muestra en pantalla: se guarda en
+        # logs/FECHA_HORA.txt (ver _escribir y _abrir_log). Para consultarlo se
+        # abre ese fichero.
+
+    @staticmethod
+    def _abrir_log():
+        """Abre el fichero de registro de esta sesion (logs/FECHA_HORA.txt).
+
+        Un fichero nuevo por arranque de la app. Es un extra: si no se puede
+        crear (permisos, disco lleno), se devuelve None y la app sigue sin
+        registro en disco, nunca cae por esto. line buffering para que cada
+        linea llegue al fichero al momento, no al cerrar.
+        """
+        try:
+            LOGS.mkdir(parents=True, exist_ok=True)
+            ruta = LOGS / f"{datetime.now():%Y-%m-%d_%H%M}.txt"
+            return open(ruta, "a", encoding="utf-8", buffering=1)
+        except OSError:
+            return None
 
     def _escribir(self, texto: str) -> None:
-        """Anade una linea al registro.
+        """Registra una linea en el fichero de sesion (logs/FECHA_HORA.txt).
 
-        El widget esta en state='disabled' para que no se pueda editar a mano;
-        hay que habilitarlo, escribir y volver a deshabilitarlo.
+        El registro ya no se muestra en pantalla; queda solo en el .txt, con la
+        hora antepuesta, para consultarlo despues del evento. Es tolerante a
+        fallos: un error de escritura nunca interrumpe la grabacion.
         """
-        self.log.configure(state="normal")
-        self.log.insert("end", texto + "\n")
-        self.log.see("end")          # sigue siempre la ultima linea
-        self.log.configure(state="disabled")
+        if self._fichero_log:
+            try:
+                self._fichero_log.write(f"{datetime.now():%H:%M:%S}  {texto}\n")
+            except OSError:
+                pass
 
     # ------------------------------------------------------------- grabacion
 
@@ -248,7 +281,8 @@ class App(tk.Tk):
                        + (f" - {info['etiqueta']}" if info["etiqueta"] else ""))
         self.btn.configure(text="DETENER ASALTO", bg=ROJO, activebackground=ROJO)
         self.entrada.configure(state="disabled")   # el nombre ya no puede cambiar
-        self.btn_subir.configure(state="disabled")  # no subir mientras se graba
+        self.btn_subir.configure(state="disabled")      # no subir mientras se graba
+        self.btn_subir_sel.configure(state="disabled")
 
     def _detener(self) -> None:
         # Bloquea unos segundos mientras se cierran los tres FFmpeg. La ventana
@@ -276,6 +310,7 @@ class App(tk.Tk):
         self.entrada.delete(0, "end")
         if not self.subiendo:
             self.btn_subir.configure(state="normal")
+            self._actualizar_btn_sel()  # rehabilita "Subir seleccionados" si hay seleccion
 
         # Aviso modal a proposito: si una camara ha fallado, el operador debe
         # enterarse ahora y poder revisarla antes del siguiente asalto, no al
@@ -303,17 +338,21 @@ class App(tk.Tk):
             return
         izq, frontal, der = ficheros
 
-        self._escribir(f"Generando mosaico del asalto {meta['asalto']:03d}...")
-        hilo = mosaico.generar(
-            carpeta, frontal=frontal, izquierda=izq, derecha=der,
-            al_terminar=self._fin_mosaico,
+        # El mosaico corre en su propio proceso con ventana propia: muestra el
+        # progreso, se cierra sola al terminar y sobrevive aunque se cierre la
+        # app. Por eso no hay callback de vuelta a la interfaz; el estado se ve
+        # en esa ventana. El fps sale de config para que el mosaico case con la
+        # cadencia de grabacion.
+        fps = int(self.sesion.cfg["video"]["fps"])
+        proc = mosaico.generar(
+            carpeta, frontal=frontal, izquierda=izq, derecha=der, fps=fps,
         )
-        if hilo is None:
+        if proc is None:
             self._escribir("    ! mosaico omitido: falta algun video")
-
-    def _fin_mosaico(self, ok: bool, mensaje: str) -> None:
-        # Llamado desde el hilo del mosaico: al hilo de Tkinter con after.
-        self.after(0, lambda: self._escribir(("" if ok else "    ! ") + mensaje))
+        else:
+            self._escribir(
+                f"Mosaico del asalto {meta['asalto']:03d} generandose en ventana aparte..."
+            )
 
     # ------------------------------------------------------------ dispositivos
 
@@ -418,6 +457,10 @@ class App(tk.Tk):
         combo.configure(values=opciones, state="readonly")
         combo.set(etiqueta)
 
+    def _camara(self, cam_id: str):
+        """La Camara con ese id, o None si no existe. Fuente unica del lookup."""
+        return next((c for c in self.sesion.camaras if c.id == cam_id), None)
+
     def _elegir_dispositivo(self, cam_id: str, combo: ttk.Combobox) -> None:
         """Guarda la eleccion de video; el micro se autoempareja."""
         if self.sesion.grabando:
@@ -427,7 +470,9 @@ class App(tk.Tk):
         dispositivo = self._map_video.get(etiqueta) if etiqueta != self.MODO_PRUEBA else None
 
         self.sesion.asignar_video(cam_id, dispositivo, self._audio_disp)
-        cam = next(c for c in self.sesion.camaras if c.id == cam_id)
+        cam = self._camara(cam_id)
+        if cam is None:
+            return  # el combo referencia una camara que ya no existe: nada que hacer
         if dispositivo:
             msg = f"{cam_id} -> {dispositivo.nombre}"
             if cam.audio:
@@ -473,7 +518,7 @@ class App(tk.Tk):
             self._escribir(f"{cam_id} -> previsualizacion cerrada")
             return
 
-        cam = next((c for c in self.sesion.camaras if c.id == cam_id), None)
+        cam = self._camara(cam_id)
         if not cam or not cam.dispositivo:
             messagebox.showinfo(
                 "Sin dispositivo",
@@ -504,6 +549,23 @@ class App(tk.Tk):
         """Asaltos grabados, ordenados. Cuelgan de la jornada: MIERCOLES_22/007_..."""
         return sorted(d for d in self.sesion.raiz.glob("*/*") if d.is_dir())
 
+    # Marca de "ya subido": un fichero vacio '.subido' dentro de la carpeta del
+    # asalto. Se usa un fichero aparte (no un campo en metadata.json) para no
+    # mezclar el registro de la grabacion con el estado de la subida, y porque
+    # asi resiste que se regrabe metadata sin afectar a la marca.
+    _MARCA_SUBIDO = ".subido"
+
+    def _esta_subido(self, carpeta: Path) -> bool:
+        return (carpeta / self._MARCA_SUBIDO).exists()
+
+    def _marcar_subidas(self, carpetas: list[Path]) -> None:
+        """Escribe la marca '.subido' en cada carpeta subida con exito."""
+        for c in carpetas:
+            try:
+                (c / self._MARCA_SUBIDO).touch()
+            except OSError:
+                pass  # no poder marcar no es critico: como mucho, el tick no sale
+
     def _pintar_lista(self, actual: str = "") -> None:
         """Rellena el recuadro con los asaltos y su tamano.
 
@@ -511,39 +573,79 @@ class App(tk.Tk):
         se marca con una flecha y se hace visible desplazando la lista.
         """
         asaltos = self._asaltos_en_disco()
+        subidos = {d: self._esta_subido(d) for d in asaltos}
 
         # Reconstruir la lista entera en cada refresco haria parpadear la
-        # seleccion, asi que solo se rehace cuando su contenido cambia.
-        firma = (tuple(str(d) for d in asaltos), actual)
+        # seleccion, asi que solo se rehace cuando su contenido cambia. El estado
+        # 'subido' entra en la firma: al marcar uno, la lista debe repintarse.
+        firma = (tuple(str(d) for d in asaltos), actual, tuple(subidos.values()))
         if firma == self._firma_lista:
             return
         self._firma_lista = firma
 
         self.lista.delete(0, "end")
+        # Mapa posicion en el Listbox -> carpeta, para saber que asalto eligio el
+        # operador. Se rehace junto con la lista. Vacio si no hay asaltos.
+        self._asaltos_lista = list(asaltos)
         if not asaltos:
             self.lista.insert("end", "  (sin asaltos grabados)")
             return
 
-        for d in asaltos:
+        for i, d in enumerate(asaltos):
             mb = sum(f.stat().st_size for f in d.glob("*.mkv") if f.is_file()) / 1e6
             etiqueta = f"{d.parent.name}/{d.name}"
             incompleto = "" if (d / "metadata.json").exists() else "  [sin metadata]"
-            marca = "> " if etiqueta == actual else "  "
-            self.lista.insert("end", f"{marca}{etiqueta}   {mb:.0f} MB{incompleto}")
+            # Prefijo: '>' el que se sube ahora; '✓' los ya subidos; si no, hueco.
             if etiqueta == actual:
-                self.lista.selection_clear(0, "end")
-                self.lista.selection_set("end")
+                marca = "> "
+            elif subidos[d]:
+                marca = "✓ "   # tick de "ya subido"
+            else:
+                marca = "  "
+            self.lista.insert("end", f"{marca}{etiqueta}   {mb:.0f} MB{incompleto}")
+            # El tick se pinta en verde (el Listbox colorea por fila completa).
+            if subidos[d] and etiqueta != actual:
+                self.lista.itemconfig(i, foreground=VERDE)
+            # Durante la subida se desplaza para tener a la vista el asalto en
+            # curso. No se toca la seleccion: esta la usa el operador para elegir
+            # que subir, y la flecha '>' ya senala el que se transfiere.
+            if etiqueta == actual:
                 self.lista.see("end")
 
+    def _actualizar_btn_sel(self) -> None:
+        """Habilita 'Subir seleccionados' solo si hay algo marcado y no se sube."""
+        hay = bool(self.lista.curselection()) and not self.subiendo and not self.sesion.grabando
+        self.btn_subir_sel.configure(state="normal" if hay else "disabled")
+
+    def _carpetas_seleccionadas(self) -> list[Path]:
+        """Carpetas de asalto marcadas en la lista, segun el mapa posicion->carpeta."""
+        return [self._asaltos_lista[i] for i in self.lista.curselection()
+                if i < len(self._asaltos_lista)]
+
     def _subir(self) -> None:
-        """Sube todas las grabaciones a OneDrive. Pensado para el final del dia."""
+        """Sube TODAS las grabaciones a OneDrive. Pensado para el final del dia."""
+        self._lanzar_subida(self._asaltos_en_disco(), selectivo=False)
+
+    def _subir_seleccionados(self) -> None:
+        """Sube solo los asaltos marcados en la lista."""
+        self._lanzar_subida(self._carpetas_seleccionadas(), selectivo=True)
+
+    def _lanzar_subida(self, carpetas: list[Path], selectivo: bool) -> None:
+        """Confirma y arranca la subida de 'carpetas' (o de todo si no es selectivo).
+
+        Ruta comun de 'Subir todo' y 'Subir seleccionados': misma confirmacion,
+        mismo bloqueo de botones y mismo arranque en hilo; solo cambia el conjunto
+        de carpetas y el mensaje.
+        """
         # Doble red de seguridad: los botones ya se deshabilitan, pero el atajo
         # de teclado o un doble clic podrian colarse igualmente.
         if self.subiendo or self.sesion.grabando:
             return
-        carpetas = self._asaltos_en_disco()
         if not carpetas:
-            messagebox.showinfo("Nada que subir", "No hay asaltos grabados.")
+            messagebox.showinfo(
+                "Nada que subir",
+                "No hay asaltos seleccionados." if selectivo else "No hay asaltos grabados."
+            )
             return
 
         # metadata.json solo existe si el asalto se cerro bien. Sin el, la
@@ -560,9 +662,10 @@ class App(tk.Tk):
             aviso = (f"\n\nAtencion: {len(incompletas)} carpeta(s) sin metadata "
                      f"(asalto interrumpido?): {nombres}")
 
+        que = "seleccionados" if selectivo else "asaltos"
         if not messagebox.askyesno(
             "Confirmar subida",
-            f"Se subiran {len(carpetas)} asaltos a:\n{destino}\n\n"
+            f"Se subiran {len(carpetas)} {que} a:\n{destino}\n\n"
             "No se borrara nada del destino." + aviso + "\n\nContinuar?"
         ):
             return
@@ -571,12 +674,21 @@ class App(tk.Tk):
         # Se bloquea tambien grabar: si empezara un asalto durante la subida,
         # rclone podria leer un fichero a medio escribir.
         self.btn_subir.configure(state="disabled")
+        self.btn_subir_sel.configure(state="disabled")
         self.btn.configure(state="disabled")
         self.barra.configure(value=0)
-        self._escribir(f"Subiendo {len(carpetas)} asaltos a {destino}...")
+        self._escribir(f"Subiendo {len(carpetas)} {que} a {destino}...")
 
-        # Arranca en un hilo y vuelve enseguida; el avance llega por callback.
-        subida.subir(self.sesion.raiz, destino, self._avance_subida, self._fin_subida)
+        # Se recuerda que se esta subiendo para, al terminar bien, marcarlas
+        # como subidas (fichero .subido en cada una). 'carpetas' ya trae la lista
+        # concreta tanto en "todo" como en selectivo.
+        self._subiendo_carpetas = list(carpetas)
+
+        # carpetas=None sube todo (mas eficiente: sin filtros --include). En
+        # subida selectiva se pasan las carpetas concretas.
+        seleccion = carpetas if selectivo else None
+        subida.subir(self.sesion.raiz, destino, self._avance_subida,
+                     self._fin_subida, carpetas=seleccion)
 
     # Los dos metodos siguientes los invoca el hilo de rclone, NO la interfaz.
     # De ahi el self.after(0, ...): encola el trabajo en el hilo de Tkinter,
@@ -597,8 +709,16 @@ class App(tk.Tk):
             self.btn.configure(state="normal")
             self.barra.configure(value=100 if ok else 0)
             self.lbl_subida.configure(text=mensaje, foreground=VERDE if ok else ROJO)
-            # Quita la marca del asalto en curso y deja la lista en reposo.
+            # Si la subida fue bien, se marca cada carpeta como subida para que
+            # la lista muestre el tick. Solo se marca al terminar OK: una subida
+            # fallida a medias no debe dar por subido nada.
+            if ok:
+                self._marcar_subidas(self._subiendo_carpetas)
+            self._subiendo_carpetas = []
+            # Limpia la seleccion y deja la lista en reposo. Sin seleccion,
+            # "Subir seleccionados" vuelve a quedar deshabilitado.
             self.lista.selection_clear(0, "end")
+            self.btn_subir_sel.configure(state="disabled")
             self._firma_lista = None
             self._pintar_lista()
             self._escribir(mensaje)
@@ -713,8 +833,16 @@ class App(tk.Tk):
                 "Subida en curso", "La subida no ha terminado. Salir igualmente?"):
             return
         self._cerrar_previews()  # no dejar ventanas de ffplay huerfanas
+        if self._fichero_log:
+            self._escribir("--- fin de sesion ---")
+            self._fichero_log.close()
         self.destroy()
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Punto de entrada. Referenciado por [project.scripts] en pyproject.toml."""
     App().mainloop()
+
+
+if __name__ == "__main__":
+    main()
