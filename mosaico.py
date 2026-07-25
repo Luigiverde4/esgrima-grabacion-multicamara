@@ -42,6 +42,39 @@ _ALTO_SUP = 720
 _ALTO_INF = _ALTO - _ALTO_SUP          # 360
 
 
+def _tiene_audio(fichero: Path) -> bool:
+  """True si el fichero de entrada contiene al menos una pista de audio."""
+  try:
+    salida = subprocess.run(
+      [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=index",
+        "-of", "csv=p=0",
+        str(fichero),
+      ],
+      capture_output=True, text=True, errors="replace", timeout=15,
+      creationflags=_NUEVA_CONSOLA,
+    ).stdout.strip()
+    return bool(salida)
+  except (FileNotFoundError, subprocess.TimeoutExpired):
+    return False
+
+
+def _duracion(fichero: Path) -> float:
+    """Segundos que dura un video, via ffprobe. 0.0 si no se puede saber."""
+    try:
+        salida = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(fichero)],
+            capture_output=True, text=True, errors="replace", timeout=15,
+            creationflags=_NUEVA_CONSOLA,
+        ).stdout.strip()
+        return float(salida)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 0.0
+
+
 def _celda(idx: int, ancho: int, alto: int, etiqueta: str, fps: int) -> str:
     """Escala una entrada a una celda 'ancho x alto' SIN deformar.
 
@@ -76,7 +109,9 @@ def _filtro(frontal_idx: int, izq_idx: int, der_idx: int, fps: int) -> str:
 
     Tres detalles imprescindibles (ver bugs en el docstring del modulo):
       - 'shortest=1' en el primer overlay: el fondo 'color' es infinito y sin
-        esto el fichero sale sin duracion. Se corta a la entrada de video.
+        esto el fichero sale sin duracion. Se corta solo al final de la entrada
+        superior; no recorta video util porque las tres ramas ya estan alineadas
+        y las caidas se declaran como huecos al concatenar.
       - 'eof_action=pass' en los overlays de los laterales: sin el, si una
         camara es MAS CORTA que las otras (pasa al relanzarla tras una caida:
         pierde el tramo caido), el overlay se queda esperando frames que no
@@ -89,10 +124,18 @@ def _filtro(frontal_idx: int, izq_idx: int, der_idx: int, fps: int) -> str:
         _celda(frontal_idx, 1280, _ALTO_SUP, "top", fps)
         + _celda(izq_idx, 960, _ALTO_INF, "bl", fps)
         + _celda(der_idx, 960, _ALTO_INF, "br", fps)
+        # Las tres ramas se unen sobre un fondo negro FINITO: 'color' con -t
+        # implicito no existe, asi que la duracion la marca el ultimo overlay
+        # con shortest=0 y eof_action=pass -> dura lo que la entrada MAS LARGA.
         + f"color=c=black:s={_ANCHO}x{_ALTO}:r={fps}[bg];"
-        + f"[bg][top]overlay=x={x_frontal}:y=0:shortest=1:eof_action=pass[a];"
-        + f"[a][bl]overlay=x=0:y={_ALTO_SUP}:eof_action=pass[b];"
-        + f"[b][br]overlay=x=960:y={_ALTO_SUP}:eof_action=pass,fps={fps}[out]"
+        # shortest=0 en los tres: el mosaico NO debe cortarse con la camara mas
+        # corta. Si una se cayo y su video acaba antes, las otras dos tienen que
+        # llegar hasta su final; la que falta se queda en negro (eof_action=pass
+        # mantiene el ultimo estado del fondo, que es negro).
+        + f"[bg][top]overlay=x={x_frontal}:y=0:shortest=0:eof_action=pass[a];"
+        + f"[a][bl]overlay=x=0:y={_ALTO_SUP}:shortest=0:eof_action=pass[b];"
+        + f"[b][br]overlay=x=960:y={_ALTO_SUP}:shortest=0:eof_action=pass,"
+        + f"fps={fps}[out]"
     )
 
 
@@ -124,6 +167,24 @@ def generar(carpeta: Path, frontal: str, izquierda: str, derecha: str,
     audio_de = audio_de or frontal
     orden = [frontal, izquierda, derecha]
     idx_audio = orden.index(audio_de) if audio_de in orden else 0
+    hay_audio = _tiene_audio(entradas[idx_audio])
+
+    # Duracion de la salida = la de la entrada MAS LARGA. Hace falta pasarla
+    # explicitamente con -t por dos motivos que van juntos:
+    #
+    #   - Los overlays llevan shortest=0 para que el mosaico NO se corte con la
+    #     camara mas corta. Si una se cayo y su video acaba antes, las otras dos
+    #     tienen que llegar a su final; antes el mosaico terminaba con la corta y
+    #     las demas nunca se veian enteras.
+    #   - Pero el fondo 'color' es una fuente INFINITA: sin shortest=1 y sin -t,
+    #     FFmpeg no termina nunca (queda 'duration=N/A' y el proceso colgado).
+    #     Ver ERRORES_CONOCIDOS.md.
+    #
+    # -t cierra las dos cosas: el mosaico dura lo que la entrada mas larga y el
+    # color deja de ser un problema. Si no se puede medir ninguna (ffprobe
+    # ausente), se cae a 0 y mas abajo se omite -t: mejor un mosaico que se corta
+    # con la mas corta que ninguno.
+    duracion_max = max((_duracion(f) for f in entradas), default=0.0)
 
     # El trabajo va en un .bat generado en la carpeta del asalto. En cmd.exe hay
     # que entrecomillar a mano: las rutas (por si tienen espacios) y sobre todo
@@ -134,17 +195,25 @@ def generar(carpeta: Path, frontal: str, izquierda: str, derecha: str,
     # Logica del .bat: ffmpeg escribe el .parcial; si sale con exito, se renombra
     # a mosaico.mkv; si falla o se interrumpe, mosaico.mkv no llega a existir. El
     # propio .bat se borra al final. La ventana se cierra sola al terminar.
-    partes = [
+    args_ffmpeg = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning", "-stats",
         "-i", f'"{entradas[0]}"', "-i", f'"{entradas[1]}"', "-i", f'"{entradas[2]}"',
         "-filter_complex", f'"{_filtro(0, 1, 2, fps)}"',
         "-map", '"[out]"',
-        # '?' -> no falla si esa cam no tiene audio (p.ej. modo sin micro).
-        "-map", f"{idx_audio}:a?",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "160k",
-        f'"{parcial}"',
+    ]
+    if duracion_max > 0:
+        # Acota la salida: sin esto el fondo 'color' no termina nunca.
+        args_ffmpeg += ["-t", f"{duracion_max:.3f}"]
+    if hay_audio:
+        # Solo se incluye audio si la fuente realmente tiene una pista.
+        # Asi evitamos el aviso de FFmpeg cuando el mosaico sale mudo.
+        args_ffmpeg += ["-map", f"{idx_audio}:a?", "-c:a", "aac", "-b:a", "160k"]
+    args_ffmpeg.append(f'"{parcial}"')
+
+    partes = [
+        *args_ffmpeg,
     ]
     bat = carpeta / "_mosaico.bat"
     contenido = (

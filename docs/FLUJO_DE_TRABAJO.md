@@ -41,12 +41,16 @@ Sin dependencias externas de Python (solo stdlib). Requiere `ffmpeg`, `ffprobe`,
 En la fila de esa cámara aparece un botón ámbar **⟳ Relanzar**. Al pulsarlo se
 vuelve a lanzar sin cortar el asalto; las otras dos no se enteran.
 
+Si la capturadora cambia o vuelve a enumerarse, pulsa **↻ Refrescar lista** y
+la fila caída queda editable para escoger el nuevo dispositivo, micro o formato
+antes de relanzar. Las demás cámaras siguen bloqueadas.
+
 - Lo grabado antes de la caída **no se pierde**: va en un fichero aparte que se
   une automáticamente al detener el asalto. Queda un solo `camN.mkv`.
 - **Se pierde el tramo** entre la caída y el momento de pulsar: se ve en negro.
-  Pero el vídeo **sigue sincronizado** con las otras cámaras — el hueco se
-  declara en la línea de tiempo, así que lo que viene después está en su sitio.
-  El fichero dura lo mismo que los de las otras cámaras.
+  Pero el vídeo **sigue sincronizado** con las otras cámaras — ese tramo se
+  rellena con un segmento negro real, así que lo que viene después está en su
+  sitio y el fichero dura lo mismo que los de las otras cámaras.
 - Al terminar sale un aviso indicando qué cámaras se relanzaron, y queda en
   `metadata.json` (campo `intentos`) y en el log de la sesión.
 

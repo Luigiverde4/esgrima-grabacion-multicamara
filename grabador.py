@@ -54,6 +54,26 @@ def _duracion(fichero: Path) -> float:
         return 0.0
 
 
+def _muestra_audio(fichero: Path) -> int | None:
+    """Frecuencia de muestreo del audio principal via ffprobe.
+
+    Se usa al generar el tramo negro para que el silencio tenga el mismo
+    formato que el resto del asalto y el demuxer concat no tenga que mezclar
+    streams con distinta frecuencia.
+    """
+    try:
+        salida = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=sample_rate",
+             "-of", "csv=p=0", str(fichero)],
+            capture_output=True, text=True, errors="replace",
+            timeout=15, creationflags=_SIN_VENTANA,
+        ).stdout.strip()
+        return int(salida) if salida else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
 @dataclass
 class Camara:
     """Una camara tal y como esta declarada en config.json."""
@@ -280,6 +300,59 @@ class GrabadorCamara:
         # sobrescribir el ultimo que quedarse sin nombre y no poder grabar.
         return carpeta / f"{self.camara.id}_z.mkv"
 
+    def _segmento_negro(self, carpeta: Path, indice: int, hueco: float,
+                        muestra_audio: int | None = None) -> Path | None:
+        """Crea un trozo negro temporal para representar un hueco de relanzamiento.
+
+        Se usa solo al unir: el trozo resultante lleva video negro real (y audio
+        en silencio si la camara tenia micro), de modo que el fichero final no
+        depende de saltos de timestamps para mostrar el tramo caido.
+        """
+        v = self.cfg["video"]
+        muestra_audio = muestra_audio or 44100
+        destino = carpeta / f"_{self.camara.id}_gap_{indice}.mkv"
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi",
+            "-i", f"color=c=black:s={v['resolucion']}:r={v['fps']}",
+        ]
+        if self.camara.con_audio:
+            cmd += [
+                "-f", "lavfi",
+                "-i", f"anullsrc=channel_layout=stereo:sample_rate={muestra_audio}",
+            ]
+        cmd += [
+            "-t", f"{hueco:.3f}",
+            "-map", "0:v:0",
+            "-c:v", "libx264",
+            "-preset", v["preset"],
+            "-crf", str(v["crf"]),
+            "-pix_fmt", "yuv420p",
+            "-g", str(v["fps"] * 2),
+        ]
+        if self.camara.con_audio:
+            cmd += [
+                "-map", "1:a:0",
+                "-c:a", "aac",
+                "-b:a", "160k",
+            ]
+        else:
+            cmd.append("-an")
+        cmd.append(str(destino))
+
+        try:
+            r = subprocess.run(
+                cmd,
+                capture_output=True, text=True, errors="replace",
+                timeout=60, creationflags=_SIN_VENTANA,
+            )
+            if r.returncode == 0 and destino.exists() and destino.stat().st_size > 0:
+                return destino
+        except (OSError, subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        destino.unlink(missing_ok=True)
+        return None
+
     def iniciar(self, carpeta: Path, relanzamiento: bool = False) -> None:
         """Lanza FFmpeg y el hilo que vigila su salida. No bloquea.
 
@@ -299,11 +372,23 @@ class GrabadorCamara:
             # Se conservan los frames de los trozos anteriores para que el
             # contador de la interfaz siga subiendo en vez de volver a cero.
             self.frames_previos = self.estado.frames
-            # Tiempo que la camara ha estado caida: desde que murio el trozo
-            # anterior hasta ahora. Se declara como hueco al concatenar, asi el
-            # video mantiene su posicion en el tiempo y no se desincroniza.
+            # Tiempo que la camara ha estado realmente sin imagen nueva.
+            # Si FFmpeg tarda en caer despues de congelarse la captura, el
+            # ultimo frame valido manda mas que el cierre del proceso; asi el
+            # hueco negro cubre tambien esos segundos "atascados".
+            ultimo_evento = self.estado.ultimo_avance
             if self._fin_trozo is not None:
-                self._hueco_pendiente = max(0.0, time.monotonic() - self._fin_trozo)
+                ultimo_evento = min(ultimo_evento, self._fin_trozo)
+            hueco = max(0.0, time.monotonic() - ultimo_evento)
+            # Se anota AQUI, alineado con el trozo que esta a punto de crearse.
+            # Antes se dejaba en _hueco_pendiente para que lo recogiera
+            # _leer_progreso() al cerrar el trozo anterior, pero ese trozo ya
+            # estaba cerrado: el valor se perdia y 'huecos' quedaba en [0.0],
+            # de modo que no se insertaba negro ninguno.
+            while len(self.huecos) < len(self.trozos):
+                self.huecos.append(0.0)
+            self.huecos.append(hueco)
+            self._hueco_pendiente = 0.0
             destino = self._siguiente_libre(carpeta)
 
         # Estado nuevo en cada arranque: arrastrar el anterior mostraria en la
@@ -385,10 +470,10 @@ class GrabadorCamara:
         if fichero and fichero.exists() and fichero.stat().st_size > 0:
             if fichero not in self.trozos:
                 self.trozos.append(fichero)
-                # Hueco previo a ESTE trozo: lo fijo iniciar() al relanzar.
+                # El hueco previo a este trozo ya lo anoto iniciar(); aqui solo
+                # se rellena si faltara (primer trozo: sin hueco por delante).
                 while len(self.huecos) < len(self.trozos):
-                    self.huecos.append(self._hueco_pendiente)
-                self._hueco_pendiente = 0.0
+                    self.huecos.append(0.0)
         # Instante de la muerte: si el operador relanza, la distancia hasta ese
         # momento es el tiempo que la camara estuvo sin grabar.
         self._fin_trozo = time.monotonic()
@@ -571,6 +656,24 @@ class Sesion:
         self._actualizar_config({"ultimo_asalto": numero})
 
     @property
+    def frontal_mosaico(self) -> str:
+        """Id de la camara que va grande arriba en el mosaico.
+
+        Por defecto la del medio en config.json, que en el reparto habitual
+        [izq, frontal, der] es la frontal. Si el id guardado ya no existe entre
+        las camaras, se vuelve a esa por defecto.
+        """
+        guardado = self.cfg.get("frontal_mosaico")
+        if guardado and any(c.id == guardado for c in self.camaras):
+            return guardado
+        medio = len(self.camaras) // 2
+        return self.camaras[medio].id if self.camaras else "cam2"
+
+    def guardar_frontal_mosaico(self, cam_id: str) -> None:
+        """Fija que camara va arriba en el mosaico y lo persiste."""
+        self._actualizar_config({"frontal_mosaico": cam_id})
+
+    @property
     def audio_mosaico(self) -> str:
         """Id de la camara de la que el mosaico toma el audio ('cam2' por defecto).
 
@@ -731,8 +834,34 @@ class Sesion:
             return g.estado.grabando
         return False
 
+    def _duracion_referencia(self) -> float:
+        """Cuanto duro el asalto en video, segun las camaras que NO se cayeron.
+
+        Se toma la mayor duracion entre las camaras de un solo trozo. Es la
+        medida fiable de lo que duro el asalto: sale del propio contenedor, no
+        de un reloj.
+
+        Por que hace falta: el hueco medido con time.monotonic() (entre que
+        muere el proceso y se pulsa Relanzar) se queda CORTO frente al tiempo
+        real perdido. La capturadora deja de dar imagen antes de que FFmpeg
+        muera, y el FFmpeg nuevo tarda en abrir el dispositivo y escribir su
+        primer frame. Con hardware real eso son varios segundos que el
+        cronometro no ve, y el video reanudado quedaba adelantado respecto a las
+        otras camaras: el mosaico terminaba antes de tiempo (`shortest=1` corta
+        con la mas corta) y las demas nunca llegaban a su final.
+
+        Devuelve 0.0 si todas las camaras se cayeron: entonces no hay referencia
+        y _unir_trozos() se queda con lo medido por reloj, que es mejor que nada.
+        """
+        duraciones = [
+            _duracion(g.trozos[0])
+            for g in self.grabadores
+            if len(g.trozos) == 1 and g.trozos[0].exists()
+        ]
+        return max(duraciones, default=0.0)
+
     @staticmethod
-    def _unir_trozos(g: GrabadorCamara) -> None:
+    def _unir_trozos(g: GrabadorCamara, referencia: float = 0.0) -> None:
         """Concatena en un solo fichero los trozos de una camara relanzada.
 
         Solo actua si hubo relanzamiento (mas de un trozo). Se usa el demuxer
@@ -744,14 +873,20 @@ class Sesion:
         FFmpeg termina bien: si la union falla, se conservan los trozos sueltos
         intactos. Nunca se destruye material grabado por un fallo al unir.
 
-        EL HUECO SE DECLARA, NO SE RELLENA. Entre trozo y trozo se escribe una
-        directiva 'duration' con los segundos que la camara estuvo caida. El
-        demuxer coloca el trozo siguiente en su posicion real en el tiempo, asi
-        que el video CONSERVA LA SINCRONIA con las demas camaras: lo que falta
-        queda como un hueco (negro al reproducir) en vez de adelantar todo lo
-        que viene despues. No cuesta frames ni recodificar; el fichero dura lo
-        mismo que el asalto, que es ademas lo que evita que el mosaico se
-        cuelgue por entradas de duracion dispar.
+        EL HUECO SE CONVIERTE EN NEGRO REAL. Entre trozo y trozo se genera un
+        segmento temporal negro con los mismos parametros de video, y audio en
+        silencio si la camara lo llevaba. Asi el fichero final muestra el tramo
+        caido como negro visible, pero sigue durando lo mismo que el asalto y
+        conserva la sincronia con las demas camaras.
+
+        EL NEGRO SE MIDE CONTRA LAS OTRAS CAMARAS, no con el cronometro.
+        'referencia' es lo que duro la camara que no se cayo; el negro necesario
+        es esa duracion menos lo que esta camara grabo de verdad. El reloj de
+        time.monotonic() se queda corto (no ve lo que tarda la capturadora en
+        morir ni el FFmpeg nuevo en arrancar) y el video reanudado salia
+        ADELANTADO: en el mosaico, cam1 iba unos segundos por delante de las
+        otras y el conjunto terminaba antes de tiempo. Con varios trozos, el
+        deficit se reparte proporcionalmente a lo medido por reloj.
         """
         existentes = [t for t in g.trozos if t.exists() and t.stat().st_size > 0]
         if len(existentes) < 2:
@@ -760,21 +895,49 @@ class Sesion:
         carpeta = existentes[0].parent
         lista = carpeta / f"_concat_{g.camara.id}.txt"
         unido = carpeta / f"{g.camara.id}_unido.mkv"
+        temporales: list[Path] = []
         try:
-            # Lista del demuxer concat. Tras cada trozo que preceda a un hueco se
-            # escribe 'duration <segundos>': OJO, esa directiva declara cuanto
-            # OCUPA EN EL TIEMPO el fichero anterior, no la longitud del hueco.
-            # Por eso se suma la duracion real del trozo mas los segundos caidos:
-            # asi el trozo siguiente entra desplazado y se conserva la sincronia.
+            muestra_audio = _muestra_audio(existentes[0])
+
+            # Huecos definitivos. Se parte de lo medido por reloj y, si hay
+            # referencia, se escala para que el total (video + negro) cuadre con
+            # lo que duraron las camaras sanas.
+            medidos = [g.huecos[i] if i < len(g.huecos) else 0.0
+                       for i in range(len(existentes))]
+            grabado = sum(_duracion(t) for t in existentes)
+            huecos = list(medidos)
+            if referencia > 0:
+                falta = referencia - grabado
+                suma_medida = sum(medidos[1:])
+                if falta > 0.1 and suma_medida > 0.1:
+                    # Reparto proporcional: respeta donde ocurrio cada caida.
+                    escala = falta / suma_medida
+                    huecos = [medidos[0]] + [h * escala for h in medidos[1:]]
+                elif falta > 0.1:
+                    # Sin medida previa util (o una sola caida): todo al primer
+                    # hueco, que es donde se sabe que estuvo la interrupcion.
+                    huecos = list(medidos)
+                    if len(huecos) > 1:
+                        huecos[1] = falta
+
+            # Lista del demuxer concat. Cada hueco se materializa como un
+            # fichero negro temporal con la misma estructura de streams, para
+            # que el resultado final no dependa de timestamps vacios.
             filas = []
             for i, t in enumerate(existentes):
                 filas.append(f"file '{t.name}'")
-                # Hueco que sigue a este trozo = el declarado para el siguiente.
-                hueco = g.huecos[i + 1] if i + 1 < len(g.huecos) else 0.0
-                if hueco > 0.1:   # por debajo de eso no compensa declararlo
-                    real = _duracion(t)
-                    if real > 0:
-                        filas.append(f"duration {real + hueco:.3f}")
+                hueco = huecos[i + 1] if i + 1 < len(huecos) else 0.0
+                if hueco > 0.1:
+                    negro = g._segmento_negro(carpeta, i + 1, hueco, muestra_audio)
+                    if negro:
+                        temporales.append(negro)
+                        filas.append(f"file '{negro.name}'")
+                    else:
+                        # Plan B: si no se pudo generar el negro, al menos se
+                        # mantiene la sincronia temporal con la directiva.
+                        real = _duracion(t)
+                        if real > 0:
+                            filas.append(f"duration {real + hueco:.3f}")
             lista.write_text("\n".join(filas) + "\n", encoding="utf-8")
             r = subprocess.run(
                 # -fflags +genpts regenera los timestamps que falten. Con trozos
@@ -799,6 +962,8 @@ class Sesion:
             # Cualquier fallo aqui deja los trozos sueltos, que son validos.
             pass
         finally:
+            for t in temporales:
+                t.unlink(missing_ok=True)
             lista.unlink(missing_ok=True)
 
     def detener_asalto(self) -> dict:
@@ -824,8 +989,13 @@ class Sesion:
         # Con los ficheros ya cerrados, se unen los trozos de las camaras que se
         # relanzaron. Es -c copy (instantaneo) y solo afecta a las que tengan
         # mas de un trozo; el caso normal no paga nada.
+        #
+        # La referencia es cuanto grabo la camara que MAS duro sin caerse: es la
+        # medida exacta de lo que duro el asalto en video, y con ella se calcula
+        # el negro que le falta a cada camara caida. Ver _unir_trozos().
+        referencia = self._duracion_referencia()
         for g in self.grabadores:
-            self._unir_trozos(g)
+            self._unir_trozos(g, referencia)
 
         info = self.asalto_actual
         fin = datetime.now()

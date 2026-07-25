@@ -213,28 +213,45 @@ class App(tk.Tk):
         self.lbl_disp = ttk.Label(pie, text="", foreground=GRIS, font=("Segoe UI", 9))
         self.lbl_disp.pack(side="left", padx=10)
 
-        # De que camara toma el audio el mosaico. Va aqui, con las camaras, y no
-        # en la seccion de subida, porque es una propiedad de la captura: el
-        # operador elige el micro mejor situado (normalmente el de la frontal).
-        ttk.Label(pie, text="audio del mosaico:", foreground=GRIS,
-                  font=("Segoe UI", 9)).pack(side="left", padx=(10, 4))
-        # Etiqueta visible ("cam2 · Frontal") -> id de camara.
-        self._map_audio_mosaico = {
+        # Ajustes del mosaico: que camara va grande arriba y de cual sale el
+        # audio. Van aqui, con las camaras, y no en la seccion de subida, porque
+        # son propiedades de la captura (que POV manda y que micro esta mejor
+        # situado), no del envio a OneDrive.
+        #
+        # Etiqueta visible ("cam2 · Frontal") -> id de camara. La comparten los
+        # dos desplegables: las opciones son las mismas.
+        self._map_camaras = {
             f"{c.id} · {c.nombre}": c.id for c in self.sesion.camaras
         }
+
+        mosaico_pie = ttk.Frame(mc)
+        mosaico_pie.pack(fill="x", pady=(6, 0))
+        ttk.Label(mosaico_pie, text="Mosaico:", foreground=GRIS,
+                  font=("Segoe UI", 9, "bold")).pack(side="left")
+
+        ttk.Label(mosaico_pie, text="arriba", foreground=GRIS,
+                  font=("Segoe UI", 9)).pack(side="left", padx=(8, 4))
+        self.combo_frontal_mos = ttk.Combobox(
+            mosaico_pie, state="readonly", width=20, font=("Segoe UI", 9),
+            values=list(self._map_camaras),
+        )
+        self.combo_frontal_mos.pack(side="left")
+        self.combo_frontal_mos.bind("<<ComboboxSelected>>",
+                                    lambda _e: self._elegir_frontal_mosaico())
+
+        ttk.Label(mosaico_pie, text="audio de", foreground=GRIS,
+                  font=("Segoe UI", 9)).pack(side="left", padx=(12, 4))
         self.combo_audio_mos = ttk.Combobox(
-            pie, state="readonly", width=20, font=("Segoe UI", 9),
-            values=list(self._map_audio_mosaico),
+            mosaico_pie, state="readonly", width=20, font=("Segoe UI", 9),
+            values=list(self._map_camaras),
         )
         self.combo_audio_mos.pack(side="left")
         self.combo_audio_mos.bind("<<ComboboxSelected>>",
                                   lambda _e: self._elegir_audio_mosaico())
-        # Refleja lo guardado en config.json.
-        actual = self.sesion.audio_mosaico
-        for etiqueta, cid in self._map_audio_mosaico.items():
-            if cid == actual:
-                self.combo_audio_mos.set(etiqueta)
-                break
+
+        # Reflejan lo guardado en config.json.
+        self._marcar_combo(self.combo_frontal_mos, self.sesion.frontal_mosaico)
+        self._marcar_combo(self.combo_audio_mos, self.sesion.audio_mosaico)
 
         # --- Subida ---
         # Con el registro fuera, esta seccion absorbe el espacio sobrante: su
@@ -432,17 +449,27 @@ class App(tk.Tk):
         """Lanza la generacion del mosaico en segundo plano, si procede.
 
         Solo si las tres camaras grabaron bien: un mosaico al que le falta un
-        POV no aporta. El orden de camaras en config es [izq, frontal, der], asi
-        que el frontal es el del medio.
+        POV no aporta.
+
+        Que camara va grande arriba lo elige el operador (desplegable del pie);
+        las otras dos se reparten la fila de abajo conservando el orden de
+        config.json, asi que el mosaico sigue leyendose de izquierda a derecha.
         """
         if fallos or len(meta["camaras"]) != 3:
             return
         carpeta = Path(meta["carpeta"])
-        # Ficheros por posicion: 0=lateral izq, 1=frontal, 2=lateral der.
-        ficheros = [c["fichero"] for c in meta["camaras"]]
-        if not all(ficheros):
+        if not all(c["fichero"] for c in meta["camaras"]):
             return
-        izq, frontal, der = ficheros
+
+        # La elegida arriba; las otras dos abajo, en el orden de config.json.
+        # Si la guardada no esta entre las grabadas, se cae a la del medio.
+        cam_arriba = self.sesion.frontal_mosaico
+        if not any(c["id"] == cam_arriba for c in meta["camaras"]):
+            cam_arriba = meta["camaras"][len(meta["camaras"]) // 2]["id"]
+        frontal = next(c["fichero"] for c in meta["camaras"]
+                       if c["id"] == cam_arriba)
+        izq, der = [c["fichero"] for c in meta["camaras"]
+                    if c["id"] != cam_arriba]
 
         # El mosaico corre en su propio proceso con ventana propia: muestra el
         # progreso, se cierra sola al terminar y sobrevive aunque se cierre la
@@ -466,7 +493,7 @@ class App(tk.Tk):
         else:
             self._escribir(
                 f"Mosaico del asalto {meta['asalto']:03d} generandose en ventana "
-                f"aparte... (audio de {cam_audio})"
+                f"aparte... (arriba {cam_arriba}, audio de {cam_audio})"
             )
 
     # ------------------------------------------------------------ dispositivos
@@ -477,11 +504,10 @@ class App(tk.Tk):
         La opcion de modo prueba va siempre la primera. Se conserva la eleccion
         guardada de cada camara aunque su dispositivo no este conectado en este
         momento: asi no se pierde la configuracion si se refresca con un cable
-        suelto (se marca como no disponible, pero no se borra).
+        suelto (se marca como no disponible, pero no se borra). Puede usarse
+        tambien durante un asalto para reenumerar una capturadora que se ha
+        reconectado.
         """
-        if self.sesion.grabando:
-            return  # no cambiar dispositivos con una grabacion en curso
-
         # Video y audio en una sola llamada a FFmpeg, y en memoria para que
         # _elegir_dispositivo pueda autoemparejar sin volver a enumerar.
         self._video_disp, self._audio_disp = dispositivos.listar_video_y_audio()
@@ -509,6 +535,11 @@ class App(tk.Tk):
             # El formato solo aplica con capturadora real.
             fila.combo_fmt.configure(
                 state="readonly" if cam.configurada else "disabled")
+
+        # Si se refresco mientras habia un asalto en curso, repinta al momento
+        # para que la fila caída quede editable sin esperar al siguiente tick.
+        if self.sesion.grabando and self.sesion.asalto_actual:
+            self._refrescar()
 
     @staticmethod
     def _construir_mapa(disps: list) -> dict:
@@ -576,9 +607,15 @@ class App(tk.Tk):
         """La Camara con ese id, o None si no existe. Fuente unica del lookup."""
         return next((c for c in self.sesion.camaras if c.id == cam_id), None)
 
+    def _camara_reasignable(self, cam_id: str) -> bool:
+        """True si esa camara puede reasignarse mientras hay un asalto en curso."""
+        if not self.sesion.grabando:
+            return False
+        return any(g.camara.id == cam_id and g.puede_relanzarse for g in self.sesion.grabadores)
+
     def _elegir_dispositivo(self, cam_id: str, combo: ttk.Combobox) -> None:
         """Guarda la eleccion de video; el micro se autoempareja."""
-        if self.sesion.grabando:
+        if self.sesion.grabando and not self._camara_reasignable(cam_id):
             return
         etiqueta = combo.get()
         # Traduce la etiqueta visible al Dispositivo (o None en modo prueba).
@@ -603,7 +640,7 @@ class App(tk.Tk):
 
     def _elegir_audio(self, cam_id: str, combo: ttk.Combobox) -> None:
         """Guarda el micro elegido a mano para una camara."""
-        if self.sesion.grabando:
+        if self.sesion.grabando and not self._camara_reasignable(cam_id):
             return
         etiqueta = combo.get()
         disp = self._map_audio.get(etiqueta) if etiqueta != self.SIN_AUDIO else None
@@ -612,15 +649,32 @@ class App(tk.Tk):
 
     def _elegir_formato(self, cam_id: str, combo: ttk.Combobox) -> None:
         """Guarda el formato de entrada elegido (MJPEG/YUYV/Auto)."""
-        if self.sesion.grabando:
+        if self.sesion.grabando and not self._camara_reasignable(cam_id):
             return
         formato = self.FORMATOS.get(combo.get(), "mjpeg")
         self.sesion.guardar_formato(cam_id, formato)
         self._escribir(f"{cam_id} · formato -> {formato}")
 
+    def _marcar_combo(self, combo: ttk.Combobox, cam_id: str) -> None:
+        """Deja el combo mostrando la etiqueta que corresponde a ese id."""
+        for etiqueta, cid in self._map_camaras.items():
+            if cid == cam_id:
+                combo.set(etiqueta)
+                return
+
+    def _elegir_frontal_mosaico(self) -> None:
+        """Guarda que camara va grande arriba en el mosaico."""
+        cam_id = self._map_camaras.get(self.combo_frontal_mos.get())
+        if not cam_id:
+            return
+        self.sesion.guardar_frontal_mosaico(cam_id)
+        cam = self._camara(cam_id)
+        self._escribir(f"mosaico · arriba -> {cam_id}"
+                       + (f" ({cam.nombre})" if cam else ""))
+
     def _elegir_audio_mosaico(self) -> None:
         """Guarda de que camara toma el audio el mosaico."""
-        cam_id = self._map_audio_mosaico.get(self.combo_audio_mos.get())
+        cam_id = self._map_camaras.get(self.combo_audio_mos.get())
         if not cam_id:
             return
         self.sesion.guardar_audio_mosaico(cam_id)
@@ -953,10 +1007,12 @@ class App(tk.Tk):
             # zip empareja fila i con grabador i: ambas listas siguen el orden
             # de config.json.
             for fila, g in zip(self.filas, self.sesion.grabadores):
-                fila.combo.configure(state="disabled")   # no cambiar fuente al vuelo
-                fila.combo_audio.configure(state="disabled")
-                fila.combo_fmt.configure(state="disabled")
-                fila.ver.configure(state="disabled")     # no previsualizar mientras graba
+                editable = g.puede_relanzarse
+                estado_combo = "readonly" if editable else "disabled"
+                fila.combo.configure(state=estado_combo)
+                fila.combo_audio.configure(state=estado_combo)
+                fila.combo_fmt.configure(state=estado_combo)
+                fila.ver.configure(state="normal" if editable else "disabled")
                 e = g.estado
                 sufijo_audio = " ♪" if g.camara.con_audio else ""
                 # Orden de prioridad: primero lo mas grave.
@@ -990,7 +1046,9 @@ class App(tk.Tk):
                         fila.relanzar.pack(side="left", padx=(6, 0))
                 elif fila.relanzar.winfo_ismapped():
                     fila.relanzar.pack_forget()
-            # El audio del mosaico no se cambia al vuelo: se aplica al terminar.
+            # Los ajustes del mosaico no se cambian al vuelo: se aplican al
+            # terminar el asalto, que es cuando se genera.
+            self.combo_frontal_mos.configure(state="disabled")
             self.combo_audio_mos.configure(state="disabled")
             self.lbl_asalto.configure(
                 text=f"Asalto {info['numero']:03d} en curso  -  {info['jornada']}"
@@ -1011,6 +1069,7 @@ class App(tk.Tk):
                 # Sin asalto en curso no hay nada que relanzar.
                 if fila.relanzar.winfo_ismapped():
                     fila.relanzar.pack_forget()
+            self.combo_frontal_mos.configure(state="readonly")
             self.combo_audio_mos.configure(state="readonly")
             n = self.sesion.siguiente_numero()
             self.lbl_asalto.configure(

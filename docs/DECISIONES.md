@@ -85,14 +85,12 @@ La unión escribe a un fichero aparte y solo sustituye al original si FFmpeg sal
 con éxito: si falla, **se conservan los trozos sueltos** — nunca se destruye
 material grabado por un fallo al unir.
 
-### El hueco de la caída se declara, no se rellena
-Entre trozo y trozo, la lista del demuxer lleva una directiva `duration` con la
-duración real del trozo **más** los segundos que la cámara estuvo caída (esa
-directiva declara cuánto ocupa en el tiempo el fichero anterior, no la longitud
-del hueco). El resultado es que el trozo siguiente entra desplazado a su posición
-real y **el vídeo conserva la sincronía** con las demás cámaras; el tramo perdido
-se ve en negro al reproducir.
-
+### El hueco de la caída se rellena con negro real
+Entre trozo y trozo se genera un segmento temporal negro con los mismos
+parametros de video, y audio en silencio si la camara lo llevaba. El demuxer
+concat une ese tramo negro con `-c copy`, asi que el video CONSERVA LA SINCRONIA
+con las demas camaras y el hueco se ve negro de verdad al reproducir, no como un
+salto de timestamps.
 Se declara en vez de rellenar con un vídeo negro porque no cuesta frames ni
 recodificar, y el fichero acaba durando lo mismo que el asalto. Eso último es
 además lo que impide que el mosaico se cuelgue con entradas de duración dispar
@@ -111,7 +109,8 @@ bueno.
 Verificado con **tres caídas seguidas** en un asalto: cuatro trozos unidos en un
 solo `cam1.mkv` de 42,58 s frente a 42,30 y 42,27 de las otras dos, con los
 huecos situados en 6,67 s (4,49 s), 17,82 s (6,70 s) y 31,19 s (3,66 s) — todos
-donde correspondía. El mosaico resultante se generó en 5 s sin avisos.
+donde correspondía, y mostrando negro real en los tramos de recuperacion. El
+mosaico resultante se generó en 5 s sin avisos.
 
 Nota: al remuxear un fichero con varios huecos, FFmpeg puede emitir avisos de
 `non monotonically increasing dts` del tipo `N >= N`. Son inofensivos —no hay
@@ -188,6 +187,17 @@ un `.bat` temporal (no `cmd /c "una línea"`) porque el `filter_complex` contien
 `&`, `()`, `;`, `[]` — metacaracteres de `cmd.exe` — y meterlo inline exige un
 escapado frágil. Rutas absolutas y filtro entrecomillado.
 → `mosaico.py`, `generar()`. Ver [ERRORES_CONOCIDOS.md](ERRORES_CONOCIDOS.md).
+
+### La cámara de arriba del mosaico se elige en la interfaz
+Qué POV va grande arriba lo decide el operador en el desplegable "Mosaico ·
+arriba"; las otras dos se reparten la fila de abajo **conservando el orden de
+`config.json`**, para que el mosaico siga leyéndose de izquierda a derecha.
+
+Se guarda como `frontal_mosaico` en `config.json` (el **id** de la cámara, no el
+fichero). Si la guardada no está entre las grabadas, se cae a la del medio.
+Es independiente del audio: cambiar una cosa no toca la otra.
+→ `app.py`, `_generar_mosaico()` / `_elegir_frontal_mosaico()`;
+`grabador.py`, `frontal_mosaico` / `guardar_frontal_mosaico()`.
 
 ### El audio del mosaico se elige en la interfaz
 El mosaico lleva **una sola** pista de audio, no la mezcla de las tres: tres
