@@ -36,6 +36,36 @@ Sin dependencias externas de Python (solo stdlib). Requiere `ffmpeg`, `ffprobe`,
 - El formato y el audio solo aplican con capturadora real; en modo prueba sus
   combos quedan deshabilitados.
 
+## Si una cámara se cae a mitad de asalto
+
+En la fila de esa cámara aparece un botón ámbar **⟳ Relanzar**. Al pulsarlo se
+vuelve a lanzar sin cortar el asalto; las otras dos no se enteran.
+
+- Lo grabado antes de la caída **no se pierde**: va en un fichero aparte que se
+  une automáticamente al detener el asalto. Queda un solo `camN.mkv`.
+- **Se pierde el tramo** entre la caída y el momento de pulsar: se ve en negro.
+  Pero el vídeo **sigue sincronizado** con las otras cámaras — el hueco se
+  declara en la línea de tiempo, así que lo que viene después está en su sitio.
+  El fichero dura lo mismo que los de las otras cámaras.
+- Al terminar sale un aviso indicando qué cámaras se relanzaron, y queda en
+  `metadata.json` (campo `intentos`) y en el log de la sesión.
+
+Antes de pulsar, comprobar el cable: si la capturadora sigue desconectada, el
+relanzamiento falla y se avisa. Si falla repetidamente, es mejor detener el
+asalto y revisar el hardware.
+
+### Caso `Error opening input files: I/O error`
+
+Es un fallo **al arrancar**, no una caída a mitad: esa cámara no llegó a grabar
+nada. El botón **⟳ Relanzar** aparece igual y se puede pulsar — pero solo
+funcionará si antes se arregla la causa. Suele ser un modo inexistente (el fps de
+`config.json` no lo da la capturadora en ese formato) más que un cable suelto;
+ver el apartado del `I/O error` en [ERRORES_CONOCIDOS.md](ERRORES_CONOCIDOS.md).
+
+Qué hacer: cambiar esa cámara a **MJPEG** en su desplegable de formato y pulsar
+Relanzar. Si vuelve a fallar, el aviso lo dirá y `intentos` seguirá en 0 (no se
+cuentan los arranques que no grabaron nada).
+
 ## Ciclo de un asalto (motor)
 
 `Sesion.iniciar_asalto(etiqueta)`:

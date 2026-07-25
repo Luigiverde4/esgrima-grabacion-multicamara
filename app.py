@@ -21,6 +21,7 @@ DOS FORMAS DE RECIBIR INFORMACION, Y POR QUE
 
 import subprocess
 import tkinter as tk
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -37,6 +38,23 @@ LOGS = RAIZ / "logs"
 
 # Colores de estado, pensados para leerse de un vistazo desde lejos.
 VERDE, ROJO, AMBAR, GRIS = "#1a7f37", "#c9252d", "#bf8700", "#57606a"
+
+
+@dataclass
+class FilaCamara:
+    """Los widgets de una camara en la interfaz.
+
+    Antes era una tupla de 6 que se desempaquetaba en tres sitios distintos;
+    al anadir el boton de relanzar se paso a dataclass para no tener que
+    contar posiciones ni tocar cada zip() al sumar un widget.
+    """
+    punto: tk.Label          # semaforo de estado
+    combo: ttk.Combobox      # dispositivo de video
+    combo_audio: ttk.Combobox
+    combo_fmt: ttk.Combobox
+    info: ttk.Label          # texto de estado (frames, error...)
+    ver: ttk.Button          # previsualizacion
+    relanzar: tk.Button      # solo visible si la camara se cae grabando
 
 
 class App(tk.Tk):
@@ -57,6 +75,8 @@ class App(tk.Tk):
         self._audio_disp: list = []   # ultimo listado de Dispositivo (audio)
         self._map_video: dict = {}    # etiqueta visible -> Dispositivo
         self._map_audio: dict = {}
+        self._contador_avisado = None  # ultimo desajuste de contador ya registrado
+        self._cache_tamano: dict[str, float] = {}  # carpeta cerrada -> MB
         self._fichero_log = self._abrir_log()  # .txt de esta sesion, o None
 
         self._construir()
@@ -153,6 +173,16 @@ class App(tk.Tk):
                              command=lambda cid=cam.id: self._previsualizar(cid))
             ver.pack(side="left", padx=(6, 0))
 
+            # Solo aparece cuando esa camara se cae con el asalto en curso: lo
+            # muestra y lo oculta _refrescar(). Se crea aqui (una vez) pero no
+            # se empaqueta todavia.
+            relanzar = tk.Button(
+                arriba, text="⟳ Relanzar", font=("Segoe UI", 9, "bold"),
+                bg=AMBAR, fg="white", relief="flat", cursor="hand2",
+                activebackground=AMBAR, activeforeground="white",
+                command=lambda cid=cam.id: self._relanzar(cid),
+            )
+
             info = ttk.Label(arriba, text="", foreground=GRIS, font=("Segoe UI", 9))
             info.pack(side="left", padx=(8, 0))
 
@@ -173,7 +203,8 @@ class App(tk.Tk):
             combo_fmt.bind("<<ComboboxSelected>>",
                            lambda _e, cid=cam.id, cb=combo_fmt: self._elegir_formato(cid, cb))
 
-            self.filas.append((punto, combo, combo_audio, combo_fmt, info, ver))
+            self.filas.append(FilaCamara(punto, combo, combo_audio, combo_fmt,
+                                         info, ver, relanzar))
 
         pie = ttk.Frame(mc)
         pie.pack(fill="x", pady=(8, 0))
@@ -181,6 +212,29 @@ class App(tk.Tk):
                    command=self._refrescar_dispositivos).pack(side="left")
         self.lbl_disp = ttk.Label(pie, text="", foreground=GRIS, font=("Segoe UI", 9))
         self.lbl_disp.pack(side="left", padx=10)
+
+        # De que camara toma el audio el mosaico. Va aqui, con las camaras, y no
+        # en la seccion de subida, porque es una propiedad de la captura: el
+        # operador elige el micro mejor situado (normalmente el de la frontal).
+        ttk.Label(pie, text="audio del mosaico:", foreground=GRIS,
+                  font=("Segoe UI", 9)).pack(side="left", padx=(10, 4))
+        # Etiqueta visible ("cam2 · Frontal") -> id de camara.
+        self._map_audio_mosaico = {
+            f"{c.id} · {c.nombre}": c.id for c in self.sesion.camaras
+        }
+        self.combo_audio_mos = ttk.Combobox(
+            pie, state="readonly", width=20, font=("Segoe UI", 9),
+            values=list(self._map_audio_mosaico),
+        )
+        self.combo_audio_mos.pack(side="left")
+        self.combo_audio_mos.bind("<<ComboboxSelected>>",
+                                  lambda _e: self._elegir_audio_mosaico())
+        # Refleja lo guardado en config.json.
+        actual = self.sesion.audio_mosaico
+        for etiqueta, cid in self._map_audio_mosaico.items():
+            if cid == actual:
+                self.combo_audio_mos.set(etiqueta)
+                break
 
         # --- Subida ---
         # Con el registro fuera, esta seccion absorbe el espacio sobrante: su
@@ -216,6 +270,12 @@ class App(tk.Tk):
         self.lista.configure(yscrollcommand=barra_lat.set)
         self.lista.pack(side="left", fill="both", expand=True)
         barra_lat.pack(side="right", fill="y")
+
+        # Resumen del total: cuantos asaltos, cuanto ocupan y cuantos faltan por
+        # subir. Va pegado a la lista porque resume lo que hay justo encima.
+        self.lbl_total = ttk.Label(ms, text="", font=("Segoe UI", 9, "bold"),
+                                   foreground=GRIS)
+        self.lbl_total.pack(anchor="w", pady=(6, 0))
 
         self.barra = ttk.Progressbar(ms, mode="determinate")
         self.barra.pack(fill="x", pady=(8, 4))
@@ -290,6 +350,10 @@ class App(tk.Tk):
         # ficheros aun sin cerrar.
         meta = self.sesion.detener_asalto()
 
+        # El asalto acaba de cerrarse y el mosaico ira anadiendo su fichero: se
+        # olvida lo cacheado para que el tamano refleje el contenido definitivo.
+        self._cache_tamano.clear()
+
         # Fichero de 0 bytes = camara que no grabo nada, aunque no diera error.
         fallos = [c for c in meta["camaras"] if c["error"] or c["tamano_bytes"] == 0]
 
@@ -300,6 +364,14 @@ class App(tk.Tk):
         )
         for c in fallos:
             self._escribir(f"    ! {c['id']}: {c['error'] or 'fichero vacio'}")
+
+        # Camaras que se cayeron y se relanzaron: su video quedo unido en un solo
+        # fichero pero con un salto donde estuvo caida. No son 'fallos' (el ultimo
+        # intento fue bien), asi que se registran aparte.
+        relanzadas = [c for c in meta["camaras"] if c.get("intentos", 1) > 1]
+        for c in relanzadas:
+            self._escribir(f"    ~ {c['id']}: relanzada {c['intentos'] - 1} vez/veces "
+                           f"- {c.get('segundos_caida', 0)}s en negro, sincronia conservada")
 
         # Mosaico automatico: solo si las tres camaras grabaron bien. Se hace en
         # segundo plano para no congelar la app entre asaltos.
@@ -320,6 +392,40 @@ class App(tk.Tk):
                 "Asalto grabado con incidencias",
                 f"{len(fallos)} de {len(meta['camaras'])} camaras han fallado.\n\n"
                 + "\n".join(f"- {c['id']}: {c['error'] or 'fichero vacio'}" for c in fallos)
+            )
+        elif relanzadas:
+            # Sin fallos pero con relanzamientos: el material esta completo salvo
+            # el hueco de la caida. Se avisa para que el operador lo sepa al
+            # revisar, pero sin la alarma de un fallo.
+            messagebox.showinfo(
+                "Asalto grabado con recuperacion",
+                f"{len(relanzadas)} camara(s) se cayeron y se relanzaron:\n\n"
+                + "\n".join(f"- {c['id']}: {c.get('segundos_caida', 0)}s caida"
+                            for c in relanzadas)
+                + "\n\nSu video quedo unido en un solo fichero y SIGUE SINCRONIZADO "
+                  "con las demas camaras: el tramo que estuvo caida se ve en negro."
+            )
+
+    def _relanzar(self, cam_id: str) -> None:
+        """Vuelve a lanzar una camara caida sin cortar el asalto.
+
+        No pide confirmacion: si el operador pulsa es porque ve la camara caida
+        y cada segundo cuenta. Lo ya grabado no se pierde (va a un fichero
+        aparte que se une al detener), asi que pulsar de mas no destruye nada.
+        """
+        cam = self._camara(cam_id)
+        nombre = f"{cam_id} · {cam.nombre}" if cam else cam_id
+        if self.sesion.relanzar_camara(cam_id):
+            self._escribir(f"{nombre} RELANZADA durante el asalto")
+        else:
+            # Puede pasar si la camara se recupero sola entre el pintado del
+            # boton y el clic, o si FFmpeg no arranca (dispositivo aun ausente).
+            self._escribir(f"{nombre}: no se pudo relanzar")
+            messagebox.showwarning(
+                "No se pudo relanzar",
+                f"No se ha podido volver a lanzar {nombre}.\n\n"
+                "Comprueba que la capturadora esta conectada. Las demas camaras "
+                "siguen grabando con normalidad."
             )
 
     def _generar_mosaico(self, meta: dict, fallos: list) -> None:
@@ -344,14 +450,23 @@ class App(tk.Tk):
         # en esa ventana. El fps sale de config para que el mosaico case con la
         # cadencia de grabacion.
         fps = int(self.sesion.cfg["video"]["fps"])
+
+        # Fichero de la camara elegida para el audio (desplegable del pie). Si la
+        # elegida no esta entre las tres, generar() cae al frontal por defecto.
+        cam_audio = self.sesion.audio_mosaico
+        audio_de = next((c["fichero"] for c in meta["camaras"]
+                         if c["id"] == cam_audio), None)
+
         proc = mosaico.generar(
             carpeta, frontal=frontal, izquierda=izq, derecha=der, fps=fps,
+            audio_de=audio_de,
         )
         if proc is None:
             self._escribir("    ! mosaico omitido: falta algun video")
         else:
             self._escribir(
-                f"Mosaico del asalto {meta['asalto']:03d} generandose en ventana aparte..."
+                f"Mosaico del asalto {meta['asalto']:03d} generandose en ventana "
+                f"aparte... (audio de {cam_audio})"
             )
 
     # ------------------------------------------------------------ dispositivos
@@ -387,13 +502,13 @@ class App(tk.Tk):
         # Etiqueta visible del formato guardado de cada camara (mjpeg -> "MJPEG").
         fmt_a_etiqueta = {v: k for k, v in self.FORMATOS.items()}
 
-        for (_punto, combo, combo_audio, combo_fmt, _info, _ver), cam in zip(
-                self.filas, self.sesion.camaras):
-            self._rellenar_combo_video(combo, cam)
-            self._rellenar_combo_audio(combo_audio, cam)
-            combo_fmt.set(fmt_a_etiqueta.get(cam.formato, "MJPEG"))
+        for fila, cam in zip(self.filas, self.sesion.camaras):
+            self._rellenar_combo_video(fila.combo, cam)
+            self._rellenar_combo_audio(fila.combo_audio, cam)
+            fila.combo_fmt.set(fmt_a_etiqueta.get(cam.formato, "MJPEG"))
             # El formato solo aplica con capturadora real.
-            combo_fmt.configure(state="readonly" if cam.configurada else "disabled")
+            fila.combo_fmt.configure(
+                state="readonly" if cam.configurada else "disabled")
 
     @staticmethod
     def _construir_mapa(disps: list) -> dict:
@@ -503,6 +618,25 @@ class App(tk.Tk):
         self.sesion.guardar_formato(cam_id, formato)
         self._escribir(f"{cam_id} · formato -> {formato}")
 
+    def _elegir_audio_mosaico(self) -> None:
+        """Guarda de que camara toma el audio el mosaico."""
+        cam_id = self._map_audio_mosaico.get(self.combo_audio_mos.get())
+        if not cam_id:
+            return
+        self.sesion.guardar_audio_mosaico(cam_id)
+        cam = self._camara(cam_id)
+        self._escribir(f"audio del mosaico -> {cam_id}"
+                       + (f" ({cam.nombre})" if cam else ""))
+        # Aviso util: elegir una camara sin micro deja el mosaico mudo, y eso
+        # solo se descubriria al reproducirlo.
+        if cam and not cam.con_audio:
+            messagebox.showwarning(
+                "Camara sin micro",
+                f"{cam_id} · {cam.nombre} no tiene microfono asignado.\n\n"
+                "El mosaico saldra SIN AUDIO. Asignale un micro en su "
+                "desplegable, o elige otra camara para el audio."
+            )
+
     def _previsualizar(self, cam_id: str) -> None:
         """Abre (o cierra) una ventana de ffplay con la imagen en vivo.
 
@@ -566,6 +700,31 @@ class App(tk.Tk):
             except OSError:
                 pass  # no poder marcar no es critico: como mucho, el tick no sale
 
+    def _tamano_mb(self, carpeta: Path) -> float:
+        """Megabytes que ocupa una carpeta de asalto (todo su contenido).
+
+        Se suma TODO el contenido, no solo los .mkv: el mosaico, la metadata y
+        cualquier parcial cuentan para el espacio real en disco, que es lo que
+        importa al mirar si cabe la jornada.
+
+        Se cachea por carpeta porque esto se llama en cada refresco (500 ms) y
+        recorrer decenas de asaltos con stat() compite por I/O con los FFmpeg que
+        estan grabando. Las carpetas ya cerradas no cambian nunca; la del asalto
+        en curso se recalcula porque su firma de tamano si varia.
+        """
+        clave = str(carpeta)
+        if clave in self._cache_tamano:
+            return self._cache_tamano[clave]
+        try:
+            mb = sum(f.stat().st_size for f in carpeta.rglob("*")
+                     if f.is_file()) / 1e6
+        except OSError:
+            return 0.0
+        # Solo se cachea si el asalto ya termino: mientras graba, el tamano sube.
+        if (carpeta / "metadata.json").exists():
+            self._cache_tamano[clave] = mb
+        return mb
+
     def _pintar_lista(self, actual: str = "") -> None:
         """Rellena el recuadro con los asaltos y su tamano.
 
@@ -574,11 +733,18 @@ class App(tk.Tk):
         """
         asaltos = self._asaltos_en_disco()
         subidos = {d: self._esta_subido(d) for d in asaltos}
+        tamanos = {d: self._tamano_mb(d) for d in asaltos}
 
         # Reconstruir la lista entera en cada refresco haria parpadear la
         # seleccion, asi que solo se rehace cuando su contenido cambia. El estado
         # 'subido' entra en la firma: al marcar uno, la lista debe repintarse.
-        firma = (tuple(str(d) for d in asaltos), actual, tuple(subidos.values()))
+        #
+        # El TAMANO tambien entra: sin el, el asalto en curso se pintaba una vez
+        # con 0 MB (la carpeta ya existe pero el .mkv acaba de crearse) y no se
+        # repintaba nunca mas, porque el resto de la firma no cambiaba. Se
+        # redondea a entero para no repintar 2 veces por segundo por unos bytes.
+        firma = (tuple(str(d) for d in asaltos), actual,
+                 tuple(subidos.values()), tuple(int(m) for m in tamanos.values()))
         if firma == self._firma_lista:
             return
         self._firma_lista = firma
@@ -589,10 +755,11 @@ class App(tk.Tk):
         self._asaltos_lista = list(asaltos)
         if not asaltos:
             self.lista.insert("end", "  (sin asaltos grabados)")
+            self._actualizar_total(0, 0.0, 0)
             return
 
         for i, d in enumerate(asaltos):
-            mb = sum(f.stat().st_size for f in d.glob("*.mkv") if f.is_file()) / 1e6
+            mb = tamanos[d]
             etiqueta = f"{d.parent.name}/{d.name}"
             incompleto = "" if (d / "metadata.json").exists() else "  [sin metadata]"
             # Prefijo: '>' el que se sube ahora; '✓' los ya subidos; si no, hueco.
@@ -602,7 +769,10 @@ class App(tk.Tk):
                 marca = "✓ "   # tick de "ya subido"
             else:
                 marca = "  "
-            self.lista.insert("end", f"{marca}{etiqueta}   {mb:.0f} MB{incompleto}")
+            # El tamano va alineado a la derecha (fuente monoespaciada) para poder
+            # comparar de un vistazo cuanto ocupa cada asalto.
+            self.lista.insert(
+                "end", f"{marca}{etiqueta:<34}{mb:>7.0f} MB{incompleto}")
             # El tick se pinta en verde (el Listbox colorea por fila completa).
             if subidos[d] and etiqueta != actual:
                 self.lista.itemconfig(i, foreground=VERDE)
@@ -611,6 +781,27 @@ class App(tk.Tk):
             # que subir, y la flecha '>' ya senala el que se transfiere.
             if etiqueta == actual:
                 self.lista.see("end")
+
+        pendientes = sum(1 for d in asaltos if not subidos[d])
+        self._actualizar_total(len(asaltos), sum(tamanos.values()), pendientes)
+
+    def _actualizar_total(self, n: int, mb: float, pendientes: int) -> None:
+        """Resumen bajo la lista: cuantos asaltos hay, cuanto ocupan y que falta.
+
+        El total en GB a partir de 1000 MB: en una jornada larga son decenas de
+        GB y leerlos en MB no dice nada de un vistazo.
+        """
+        if not n:
+            self.lbl_total.configure(text="Sin asaltos grabados")
+            return
+        tamano = f"{mb/1000:.1f} GB" if mb >= 1000 else f"{mb:.0f} MB"
+        texto = f"{n} asalto{'s' if n != 1 else ''}  ·  {tamano} en disco"
+        if pendientes:
+            texto += f"  ·  {pendientes} sin subir"
+        else:
+            texto += "  ·  todos subidos"
+        self.lbl_total.configure(text=texto,
+                                 foreground=AMBAR if pendientes else VERDE)
 
     def _actualizar_btn_sel(self) -> None:
         """Habilita 'Subir seleccionados' solo si hay algo marcado y no se sube."""
@@ -715,6 +906,7 @@ class App(tk.Tk):
             if ok:
                 self._marcar_subidas(self._subiendo_carpetas)
             self._subiendo_carpetas = []
+            self._cache_tamano.clear()  # el mosaico pudo cambiar algun tamano
             # Limpia la seleccion y deja la lista en reposo. Sin seleccion,
             # "Subir seleccionados" vuelve a quedar deshabilitado.
             self.lista.selection_clear(0, "end")
@@ -760,34 +952,46 @@ class App(tk.Tk):
             info = self.sesion.asalto_actual
             # zip empareja fila i con grabador i: ambas listas siguen el orden
             # de config.json.
-            for (punto, combo, combo_audio, combo_fmt, lbl, ver), g in zip(
-                    self.filas, self.sesion.grabadores):
-                combo.configure(state="disabled")        # no cambiar fuente al vuelo
-                combo_audio.configure(state="disabled")
-                combo_fmt.configure(state="disabled")
-                ver.configure(state="disabled")          # no previsualizar mientras graba
+            for fila, g in zip(self.filas, self.sesion.grabadores):
+                fila.combo.configure(state="disabled")   # no cambiar fuente al vuelo
+                fila.combo_audio.configure(state="disabled")
+                fila.combo_fmt.configure(state="disabled")
+                fila.ver.configure(state="disabled")     # no previsualizar mientras graba
                 e = g.estado
                 sufijo_audio = " ♪" if g.camara.con_audio else ""
                 # Orden de prioridad: primero lo mas grave.
                 if e.error:
-                    punto.configure(fg=ROJO)
-                    lbl.configure(text=e.error, foreground=ROJO)
+                    fila.punto.configure(fg=ROJO)
+                    fila.info.configure(text=e.error, foreground=ROJO)
                 elif e.bloqueada:
                     # Sigue grabando, pero el contador de frames no avanza:
                     # tipicamente un HDMI suelto. El fichero crece con imagen fija.
-                    punto.configure(fg=AMBAR)
-                    lbl.configure(text="SIN SENAL - imagen congelada", foreground=AMBAR)
+                    fila.punto.configure(fg=AMBAR)
+                    fila.info.configure(text="SIN SENAL - imagen congelada",
+                                        foreground=AMBAR)
                 elif e.grabando:
-                    punto.configure(fg=VERDE)
+                    fila.punto.configure(fg=VERDE)
                     mb = (e.fichero.stat().st_size / 1e6
                           if e.fichero and e.fichero.exists() else 0)
-                    lbl.configure(text=f"grabando - {e.frames} frames - {mb:.0f} MB{sufijo_audio}",
-                                  foreground=VERDE)
+                    fila.info.configure(
+                        text=f"grabando - {e.frames} frames - {mb:.0f} MB{sufijo_audio}",
+                        foreground=VERDE)
                 else:
                     # Proceso terminado sin error registrado: no deberia pasar
                     # durante un asalto, asi que se marca en rojo igualmente.
-                    punto.configure(fg=ROJO)
-                    lbl.configure(text="detenida", foreground=ROJO)
+                    fila.punto.configure(fg=ROJO)
+                    fila.info.configure(text="detenida", foreground=ROJO)
+
+                # El boton de relanzar aparece solo mientras esa camara este
+                # caida: es la unica situacion en que hacer algo es util, y asi
+                # no ocupa sitio ni invita a pulsarlo cuando todo va bien.
+                if g.puede_relanzarse:
+                    if not fila.relanzar.winfo_ismapped():
+                        fila.relanzar.pack(side="left", padx=(6, 0))
+                elif fila.relanzar.winfo_ismapped():
+                    fila.relanzar.pack_forget()
+            # El audio del mosaico no se cambia al vuelo: se aplica al terminar.
+            self.combo_audio_mos.configure(state="disabled")
             self.lbl_asalto.configure(
                 text=f"Asalto {info['numero']:03d} en curso  -  {info['jornada']}"
             )
@@ -795,20 +999,24 @@ class App(tk.Tk):
             # En reposo: el punto refleja si la camara tiene fuente asignada
             # (verde apagado) o esta en modo prueba (gris). El combo vuelve a
             # ser seleccionable y la etiqueta de estado se limpia.
-            for (punto, combo, combo_audio, combo_fmt, lbl, ver), cam in zip(
-                    self.filas, self.sesion.camaras):
-                punto.configure(fg=VERDE if cam.configurada else GRIS)
-                combo.configure(state="readonly")
+            for fila, cam in zip(self.filas, self.sesion.camaras):
+                fila.punto.configure(fg=VERDE if cam.configurada else GRIS)
+                fila.combo.configure(state="readonly")
                 # Audio y formato solo tienen sentido con video real.
                 estado_extra = "readonly" if cam.configurada else "disabled"
-                combo_audio.configure(state=estado_extra)
-                combo_fmt.configure(state=estado_extra)
-                ver.configure(state="normal")
-                lbl.configure(text="")
+                fila.combo_audio.configure(state=estado_extra)
+                fila.combo_fmt.configure(state=estado_extra)
+                fila.ver.configure(state="normal")
+                fila.info.configure(text="")
+                # Sin asalto en curso no hay nada que relanzar.
+                if fila.relanzar.winfo_ismapped():
+                    fila.relanzar.pack_forget()
+            self.combo_audio_mos.configure(state="readonly")
             n = self.sesion.siguiente_numero()
             self.lbl_asalto.configure(
                 text=f"Listo - siguiente: asalto {n:03d}  -  {self.sesion.carpeta_dia()}"
             )
+            self._avisar_contador_ignorado()
 
         # La lista de asaltos solo se toca cuando no hay subida en marcha: si la
         # hay, la mantiene _avance_subida() para marcar el que se transfiere.
@@ -817,6 +1025,30 @@ class App(tk.Tk):
 
         # Se reencola el proximo refresco: aqui es donde el ciclo se perpetua.
         self.after(500, self._refrescar)
+
+    def _avisar_contador_ignorado(self) -> None:
+        """Avisa si el contador de config.json va por detras de lo grabado.
+
+        Pasa al restaurar un config antiguo o al editarlo a mano. La numeracion
+        no corre peligro (siguiente_numero() toma el mayor de los dos), pero en
+        silencio es indistinguible de un fallo al guardar: sin este aviso, bajar
+        el contador a mano parece no tener efecto y no se sabe por que.
+
+        Se registra una sola vez por desajuste, no en cada refresco de 500 ms.
+        """
+        desajuste = self.sesion.contador_ignorado
+        if desajuste == self._contador_avisado:
+            return
+        self._contador_avisado = desajuste
+        if desajuste is None:
+            return
+        guardado, en_disco = desajuste
+        self._escribir(
+            f"Aviso: 'ultimo_asalto' en config.json es {guardado}, pero hay "
+            f"asaltos grabados hasta el {en_disco:03d}. Se numera desde el disco "
+            f"({en_disco + 1:03d}) para no sobrescribir. Para renumerar mas bajo, "
+            f"archiva antes las jornadas anteriores."
+        )
 
     def _al_cerrar(self) -> None:
         """Impide cerrar por accidente con un asalto o una subida en marcha.

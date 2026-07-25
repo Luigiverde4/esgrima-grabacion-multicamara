@@ -95,6 +95,28 @@ devolver código 1 por el `del` que se autoborra mientras `cmd` lo tiene abierto
 Es inofensivo: si `mosaico.mkv` existe y tiene duración, el mosaico está bien. La
 app no mira ese código (proceso independiente).
 
+## Mosaico colgado tras relanzar una cámara (duraciones dispares)
+
+**Síntoma:** el mosaico no termina nunca. La ventana se queda parada, queda un
+`mosaico.parcial.mkv` que **no crece** (clavado en ~1,3 MB) y un `ffmpeg.exe`
+acumulando más de 1 GB de RAM. Pasa solo en asaltos donde se relanzó una cámara.
+
+**Causa:** al relanzar, esa cámara pierde el tramo que estuvo caída y su vídeo
+queda **más corto** que los otros dos (caso real: 64,7 s frente a 77,6 s). Los
+overlays de los laterales esperaban frames que ya no llegaban, y como el fondo
+`color` es una fuente infinita, el grafo no terminaba nunca.
+
+**Corregido** con `eof_action=pass` en los tres overlays: al agotarse una
+entrada se sigue con lo que haya debajo en vez de bloquear. → `mosaico.py`,
+`_filtro()`.
+
+**Verificado:** los mismos ficheros que llevaban media hora colgados generaron el
+mosaico completo (77,600 s, 30 fps, audio incluido) sin bloqueo.
+
+**Si te encuentras uno colgado:** matar el `ffmpeg.exe`, borrar
+`mosaico.parcial.mkv` y `_mosaico.bat`, y volver a lanzarlo. Las grabaciones
+`camN.mkv` **no están afectadas** — el mosaico es un proceso aparte que solo lee.
+
 ## Escapado en cmd.exe (mosaico)
 
 **Síntoma (histórico):** el mosaico fallaba al lanzarse aunque el comando FFmpeg
@@ -107,6 +129,27 @@ comando. `subprocess.list2cmdline` no lo entrecomilla porque no tiene espacios.
 **Solución:** un `.bat` temporal con **rutas absolutas** y el `filter_complex`
 **entrecomillado a mano**. FFmpeg quita las comillas al parsear sus argumentos,
 así que le llegan intactos. → `mosaico.py`, `generar()`.
+
+## `real-time buffer ... too full` — las tres cámaras marcadas como fallidas
+
+**Síntoma:** al terminar el asalto salta "3 de 3 cámaras han fallado" con un
+mensaje `[dshow @ ...] real-time buffer [...] too full or near too full (...),
+frame dropped!`. Pero los vídeos se reproducen bien.
+
+**Causa:** es un **aviso, no un fallo**. dshow avisa de que se le llenó el búfer
+de entrada (`-rtbufsize`) y descartó algún frame; FFmpeg sigue grabando y el
+fichero queda correcto. No estaba en `_RUIDO`, así que se guardaba como error de
+cámara. → corregido añadiendo `real-time buffer` a `_RUIDO` en `grabador.py`.
+
+**Pero comprobar los frames igualmente:** el aviso sí indica pérdida real de
+frames. En un caso real (asalto 044, `yuyv422` a 1080p30): 37,1 s deberían dar
+~1110 frames por cámara y dieron 756 / 786 / 842 — dispares entre sí y muy por
+debajo. Eso es el USB quedándose corto con YUV sin comprimir, no un problema de
+software. Ver el `I/O error` de YUV más arriba: la solución es puertos USB 3.0
+con ancho suficiente, o pasar esas cámaras a **MJPEG**.
+
+Regla: el aviso ya no marca la cámara en rojo, pero si aparece, mirar `frames` en
+`metadata.json` antes del siguiente asalto.
 
 ## Falsas alarmas de "cámara caída"
 

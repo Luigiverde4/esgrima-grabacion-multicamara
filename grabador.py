@@ -34,6 +34,26 @@ import dispositivos
 _SIN_VENTANA = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
 
 
+def _duracion(fichero: Path) -> float:
+    """Segundos que dura un video, via ffprobe. 0.0 si no se puede saber.
+
+    Se pregunta a ffprobe en vez de fiarse del reloj porque lo que importa al
+    concatenar es la duracion REAL del contenedor. Devuelve 0.0 tambien cuando
+    el fichero quedo mal cerrado (duracion 'N/A'), y quien llama lo trata como
+    'no declarar hueco', que es lo prudente.
+    """
+    try:
+        salida = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(fichero)],
+            capture_output=True, text=True, errors="replace",
+            timeout=15, creationflags=_SIN_VENTANA,
+        ).stdout.strip()
+        return float(salida)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 0.0
+
+
 @dataclass
 class Camara:
     """Una camara tal y como esta declarada en config.json."""
@@ -97,7 +117,13 @@ class GrabadorCamara:
     revision tecnica; para montaje sincronizado al frame haria falta claqueta.
     """
 
-    _RE_FRAME = re.compile(r"frame=\s*(\d+)")
+    # Anclado al principio de linea a proposito: '-progress' siempre emite
+    # 'frame=N' al inicio. Sin el ancla, un error que mencione 'frame=' (p.ej.
+    # "Error while decoding stream #0:0: frame= 12") se contaria como avance:
+    # la linea no llegaria a _ultimas_lineas y ademas refrescaria ultimo_avance,
+    # desactivando la deteccion de imagen congelada. Es decir, daria una camara
+    # por buena cuando no lo esta, que es peor que una falsa alarma.
+    _RE_FRAME = re.compile(r"^frame=\s*(\d+)")
 
     # Prefijos de las lineas de telemetria de -progress.
     _TELEMETRIA = ("bitrate=", "total_size=", "out_time", "speed=", "fps=",
@@ -108,8 +134,19 @@ class GrabadorCamara:
     #
     # Al anadir entradas aqui, comprobar que no tapan un fallo real: una camara
     # marcada como correcta cuando no graba es peor que una falsa alarma.
+    # 'real-time buffer ... too full ... frame dropped!': dshow avisa de que se
+    # le lleno el buffer y perdio algun frame. La grabacion CONTINUA y el fichero
+    # queda correcto, asi que no es un fallo de camara. Es habitual en yuyv422 a
+    # 1080p (sin comprimir satura el USB) y marcaba las tres camaras como caidas
+    # en un asalto perfectamente valido.
+    #
+    # No tapa un fallo real: si la camara dejara de dar imagen, el contador de
+    # frames se detiene y EstadoCamara.bloqueada lo delata igual. La perdida de
+    # frames que este aviso denuncia se ve ademas en 'frames' de metadata.json
+    # (ver ERRORES_CONOCIDOS.md: frames dispares = USB corto).
     _RUIDO = ("fontconfig", "deprecated", "last message repeated",
-              "non-monotonic", "past duration", "vbv underflow")
+              "non-monotonic", "past duration", "vbv underflow",
+              "real-time buffer")
 
     @classmethod
     def _es_ruido(cls, linea: str) -> bool:
@@ -124,6 +161,20 @@ class GrabadorCamara:
         self._hilo: threading.Thread | None = None
         self._ultimas_lineas: list[str] = []
         self._detencion_pedida = False  # distingue parada nuestra de caida real
+
+        # Ficheros grabados por esta camara en el asalto, en orden. Normalmente
+        # uno; hay mas si el operador relanzo tras una caida. Al detener se
+        # concatenan en uno solo (ver Sesion._unir_trozos).
+        self.trozos: list[Path] = []
+        self.frames_previos = 0   # frames de los trozos ya cerrados
+        self.carpeta: Path | None = None
+
+        # Segundos que la camara estuvo caida antes de cada trozo, en paralelo a
+        # self.trozos (el primero siempre 0.0). Se declaran como hueco al unir,
+        # para que el video conserve la sincronia con las demas camaras.
+        self.huecos: list[float] = []
+        self._fin_trozo: float | None = None   # monotonic al morir el ultimo trozo
+        self._hueco_pendiente = 0.0            # hueco medido, aun sin asignar
 
     def _entrada(self) -> list[str]:
         """Argumentos de entrada segun sea testsrc o capturadora real."""
@@ -203,11 +254,60 @@ class GrabadorCamara:
         cmd += ["-y", str(destino)]
         return cmd
 
-    def iniciar(self, carpeta: Path) -> None:
-        """Lanza FFmpeg y el hilo que vigila su salida. No bloquea."""
-        destino = carpeta / f"{self.camara.id}.mkv"
-        # Estado nuevo en cada asalto: arrastrar el anterior mostraria en la
-        # interfaz frames o errores del asalto ya terminado.
+    @property
+    def puede_relanzarse(self) -> bool:
+        """True si esta camara esta caida y se puede volver a lanzar.
+
+        Solo tiene sentido con el asalto en curso: la camara ya no graba (el
+        proceso murio o fallo al arrancar) pero las demas siguen. No se exige
+        que haya error registrado porque una camara puede terminar sin decir
+        nada y seguir siendo un fallo.
+        """
+        return self.carpeta is not None and not self.estado.grabando
+
+    def _siguiente_libre(self, carpeta: Path) -> Path:
+        """Primer nombre de trozo sin usar: cam1_b.mkv, cam1_c.mkv...
+
+        Se busca por el fichero en disco y no por len(self.trozos) porque un
+        intento fallido no deja fichero ni cuenta como trozo: si se numerara por
+        la lista, el siguiente relanzamiento podria pisar un trozo bueno.
+        """
+        for letra in "bcdefghijklmnopqrstuvwxyz":
+            candidato = carpeta / f"{self.camara.id}_{letra}.mkv"
+            if not candidato.exists():
+                return candidato
+        # 25 relanzamientos en un asalto: inalcanzable en la practica, pero mejor
+        # sobrescribir el ultimo que quedarse sin nombre y no poder grabar.
+        return carpeta / f"{self.camara.id}_z.mkv"
+
+    def iniciar(self, carpeta: Path, relanzamiento: bool = False) -> None:
+        """Lanza FFmpeg y el hilo que vigila su salida. No bloquea.
+
+        'relanzamiento' distingue el arranque normal del asalto de volver a
+        lanzar una camara caida. Al relanzar se escribe en un fichero libre
+        (cam1_b.mkv, cam1_c.mkv...) para no pisar lo ya grabado; al detener el
+        asalto se concatenan en un unico cam1.mkv (ver Sesion._unir_trozos).
+        """
+        self.carpeta = carpeta
+        if not relanzamiento:
+            self.trozos = []
+            self.huecos = []
+            self.frames_previos = 0
+            self._hueco_pendiente = 0.0
+            destino = carpeta / f"{self.camara.id}.mkv"
+        else:
+            # Se conservan los frames de los trozos anteriores para que el
+            # contador de la interfaz siga subiendo en vez de volver a cero.
+            self.frames_previos = self.estado.frames
+            # Tiempo que la camara ha estado caida: desde que murio el trozo
+            # anterior hasta ahora. Se declara como hueco al concatenar, asi el
+            # video mantiene su posicion en el tiempo y no se desincroniza.
+            if self._fin_trozo is not None:
+                self._hueco_pendiente = max(0.0, time.monotonic() - self._fin_trozo)
+            destino = self._siguiente_libre(carpeta)
+
+        # Estado nuevo en cada arranque: arrastrar el anterior mostraria en la
+        # interfaz frames o errores del asalto (o del intento) ya terminado.
         self.estado = EstadoCamara(grabando=True, fichero=destino)
         self._ultimas_lineas = []
         self._detencion_pedida = False
@@ -230,6 +330,13 @@ class GrabadorCamara:
             self.estado.grabando = False
             self.estado.error = "FFmpeg no encontrado en el PATH"
             return
+
+        # OJO: el trozo NO se anota aqui. Que Popen no falle solo significa que
+        # el ejecutable existe; FFmpeg puede morir un instante despues sin haber
+        # creado el fichero (p.ej. 'I/O error' al abrir una capturadora con un
+        # modo inexistente). Anotarlo aqui inflaba el contador de intentos con
+        # arranques que no grabaron nada. Se anota en _cerrar_trozo(), cuando ya
+        # se sabe si dejo fichero con contenido.
 
         # daemon=True: si la aplicacion se cierra de golpe, estos hilos no
         # impiden que el proceso Python termine.
@@ -254,7 +361,9 @@ class GrabadorCamara:
                 continue
 
             if m := self._RE_FRAME.search(linea):
-                self.estado.frames = int(m.group(1))
+                # Se suman los trozos anteriores: tras un relanzamiento el
+                # contador de la interfaz debe seguir subiendo, no reiniciarse.
+                self.estado.frames = self.frames_previos + int(m.group(1))
                 # Esta marca es la que permite detectar la imagen congelada:
                 # si deja de refrescarse, EstadoCamara.bloqueada se activa.
                 self.estado.ultimo_avance = time.monotonic()
@@ -269,6 +378,21 @@ class GrabadorCamara:
         codigo = self._proc.wait()
         self.estado.grabando = False
 
+        # Se cuenta como trozo solo si dejo fichero con contenido. Un arranque
+        # fallido ('I/O error' al abrir la capturadora) no deja nada y no debe
+        # contar como intento grabado ni entrar en la concatenacion.
+        fichero = self.estado.fichero
+        if fichero and fichero.exists() and fichero.stat().st_size > 0:
+            if fichero not in self.trozos:
+                self.trozos.append(fichero)
+                # Hueco previo a ESTE trozo: lo fijo iniciar() al relanzar.
+                while len(self.huecos) < len(self.trozos):
+                    self.huecos.append(self._hueco_pendiente)
+                self._hueco_pendiente = 0.0
+        # Instante de la muerte: si el operador relanza, la distancia hasta ese
+        # momento es el tiempo que la camara estuvo sin grabar.
+        self._fin_trozo = time.monotonic()
+
         # El codigo de salida por si solo NO sirve para decidir si hubo fallo:
         # al pararlo nosotros, FFmpeg puede devolver 1 o 255 con la grabacion
         # perfectamente correcta. De ahi que se distinga por que murio.
@@ -281,18 +405,15 @@ class GrabadorCamara:
             detalle = self._ultimas_lineas[-1] if self._ultimas_lineas else f"codigo {codigo}"
             self.estado.error = detalle[:120]
 
-    def detener(self) -> None:
-        """Cierra FFmpeg dejandole finalizar el fichero correctamente.
+    def pedir_parada(self) -> None:
+        """Envia la 'q' a FFmpeg sin esperar a que termine.
 
-        Enviar 'q' por stdin es lo que hace que FFmpeg escriba el indice y la
-        duracion del MKV antes de salir. Matarlo con terminate() produce un
-        fichero reproducible pero sin duracion, que en un reproductor sale sin
-        barra de tiempo y complica revisar el asalto.
-
-        Cascada de tres intentos, de mas suave a mas brusco:
-            1. 'q' + esperar 8 s  -> cierre limpio, con duracion
-            2. terminate() + 5 s  -> fichero valido, sin duracion
-            3. kill()             -> ultimo recurso
+        Separado de esperar_cierre() para que Sesion pueda cortar las tres
+        camaras casi a la vez. Cuando se hacia todo seguido, cada camara seguia
+        grabando mientras la anterior cerraba (hasta 8 s cada una) y los tres
+        POV salian con duraciones muy dispares: 26 / 29 / 33 s en un caso real.
+        La 'q' es lo que fija el instante de corte, asi que enviarlas juntas
+        deja las duraciones a menos de un segundo.
         """
         # Se marca ANTES de tocar el proceso: el hilo lector puede despertarse
         # en cuanto FFmpeg muera, y necesita saber que la parada es nuestra.
@@ -305,15 +426,31 @@ class GrabadorCamara:
                 self._proc.stdin.write("q")
                 self._proc.stdin.flush()
                 self._proc.stdin.close()
-            self._proc.wait(timeout=8)
-        except (subprocess.TimeoutExpired, OSError, ValueError):
-            # OSError/ValueError: el pipe ya estaba roto o cerrado, lo que pasa
-            # si FFmpeg habia muerto justo antes de escribir la 'q'.
+        except (OSError, ValueError):
+            # El pipe ya estaba roto o cerrado: FFmpeg habia muerto justo antes
+            # de escribir la 'q'. esperar_cierre() se encarga del resto.
+            pass
+
+    def esperar_cierre(self) -> None:
+        """Espera a que FFmpeg acabe de escribir el fichero.
+
+        Se llama despues de pedir_parada(). Como los tres esperan en paralelo
+        (ya tienen su 'q' enviada), el timeout de 8 s es del conjunto, no por
+        camara.
+
+        Cascada de dos respaldos si no cierra solo:
+            terminate() + 5 s  -> fichero valido, sin duracion
+            kill()             -> ultimo recurso
+        """
+        if self._proc and self._proc.poll() is None:
             try:
-                self._proc.terminate()
-                self._proc.wait(timeout=5)
+                self._proc.wait(timeout=8)
             except subprocess.TimeoutExpired:
-                self._proc.kill()
+                try:
+                    self._proc.terminate()
+                    self._proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
 
         # Esperar al hilo lector garantiza que estado.error ya esta escrito
         # cuando Sesion.detener_asalto() vaya a componer el metadata.json.
@@ -337,6 +474,12 @@ class Sesion:
 
         self.grabadores: list[GrabadorCamara] = []
         self.asalto_actual: dict | None = None
+
+        # Ultimo desajuste detectado entre el contador de config.json y lo que
+        # hay grabado, o None si van acordes. Lo escribe siguiente_numero() y lo
+        # lee la interfaz para avisar. Se guarda en vez de avisar desde aqui
+        # porque este modulo no sabe que existe una GUI.
+        self.contador_ignorado: tuple[int, int] | None = None
 
     # Dias de la semana en mayusculas, indexados por datetime.weekday().
     _DIAS = ("LUNES", "MARTES", "MIERCOLES", "JUEVES", "VIERNES", "SABADO", "DOMINGO")
@@ -363,9 +506,17 @@ class Sesion:
         Aun asi se contrasta con lo que hay grabado y se toma el mayor de los
         dos. Es una red de seguridad: si config.json se pierde o se restaura una
         copia antigua, un contador atrasado sobrescribiria asaltos ya grabados.
+
+        Consecuencia de ese max(): el contador solo puede SUBIR. Bajarlo a mano
+        en config.json no renumera nada mientras queden grabaciones mas altas en
+        disco; para renumerar hay que archivar antes esas jornadas. Cuando el
+        disco manda se anota en self.contador_ignorado para que la interfaz lo
+        avise: en silencio es indistinguible de un fallo al guardar.
         """
         guardado = int(self.cfg.get("ultimo_asalto", 0))
-        return max(guardado, self._maximo_en_disco()) + 1
+        en_disco = self._maximo_en_disco()
+        self.contador_ignorado = (guardado, en_disco) if en_disco > guardado else None
+        return max(guardado, en_disco) + 1
 
     def _maximo_en_disco(self) -> int:
         """Mayor numero de asalto presente en las carpetas ya grabadas.
@@ -418,6 +569,24 @@ class Sesion:
     def _guardar_contador(self, numero: int) -> None:
         """Anota en config.json el ultimo numero de asalto usado."""
         self._actualizar_config({"ultimo_asalto": numero})
+
+    @property
+    def audio_mosaico(self) -> str:
+        """Id de la camara de la que el mosaico toma el audio ('cam2' por defecto).
+
+        Se guarda el id y no el nombre de fichero para que siga valiendo si
+        cambian los nombres. Si el guardado ya no existe entre las camaras, se
+        cae a la frontal (la del medio), que es el reparto habitual.
+        """
+        guardado = self.cfg.get("audio_mosaico")
+        if guardado and any(c.id == guardado for c in self.camaras):
+            return guardado
+        medio = len(self.camaras) // 2
+        return self.camaras[medio].id if self.camaras else "cam2"
+
+    def guardar_audio_mosaico(self, cam_id: str) -> None:
+        """Fija de que camara toma el audio el mosaico y lo persiste."""
+        self._actualizar_config({"audio_mosaico": cam_id})
 
     def _persistir_camaras(self) -> None:
         """Vuelca el estado de los objetos Camara vivos a config.json.
@@ -534,6 +703,104 @@ class Sesion:
         }
         return self.asalto_actual
 
+    def relanzar_camara(self, cam_id: str) -> bool:
+        """Vuelve a lanzar una camara caida sin interrumpir el asalto.
+
+        Pensado para la caida en directo: se afloja un USB, esa camara muere y
+        las otras dos siguen. Antes habia que detener el asalto entero; asi se
+        recupera la camara y se pierde solo el hueco hasta que el operador pulsa.
+
+        Lo ya grabado NO se sobrescribe: el nuevo intento escribe un fichero
+        aparte (cam1_b.mkv) y al detener el asalto se concatenan todos en un
+        unico cam1.mkv. Devuelve False si no hay asalto, la camara no existe o
+        sigue grabando (nada que relanzar).
+        """
+        if not self.asalto_actual:
+            return False
+        for g in self.grabadores:
+            if g.camara.id != cam_id:
+                continue
+            if not g.puede_relanzarse:
+                return False
+            g.iniciar(self.asalto_actual["carpeta"], relanzamiento=True)
+            # Margen para que un arranque fallido se manifieste. FFmpeg tarda
+            # unas decimas en abortar con 'I/O error' (capturadora ausente o
+            # modo inexistente); sin esta espera se informaria de un
+            # relanzamiento correcto que en realidad murio al instante.
+            time.sleep(1.2)
+            return g.estado.grabando
+        return False
+
+    @staticmethod
+    def _unir_trozos(g: GrabadorCamara) -> None:
+        """Concatena en un solo fichero los trozos de una camara relanzada.
+
+        Solo actua si hubo relanzamiento (mas de un trozo). Se usa el demuxer
+        'concat' con -c copy: no recodifica, asi que es instantaneo y sin
+        perdida. Los trozos comparten codec, resolucion y timebase por venir del
+        mismo comando(), que es lo que exige el demuxer.
+
+        El resultado se escribe aparte y solo sustituye al primer trozo si
+        FFmpeg termina bien: si la union falla, se conservan los trozos sueltos
+        intactos. Nunca se destruye material grabado por un fallo al unir.
+
+        EL HUECO SE DECLARA, NO SE RELLENA. Entre trozo y trozo se escribe una
+        directiva 'duration' con los segundos que la camara estuvo caida. El
+        demuxer coloca el trozo siguiente en su posicion real en el tiempo, asi
+        que el video CONSERVA LA SINCRONIA con las demas camaras: lo que falta
+        queda como un hueco (negro al reproducir) en vez de adelantar todo lo
+        que viene despues. No cuesta frames ni recodificar; el fichero dura lo
+        mismo que el asalto, que es ademas lo que evita que el mosaico se
+        cuelgue por entradas de duracion dispar.
+        """
+        existentes = [t for t in g.trozos if t.exists() and t.stat().st_size > 0]
+        if len(existentes) < 2:
+            return
+
+        carpeta = existentes[0].parent
+        lista = carpeta / f"_concat_{g.camara.id}.txt"
+        unido = carpeta / f"{g.camara.id}_unido.mkv"
+        try:
+            # Lista del demuxer concat. Tras cada trozo que preceda a un hueco se
+            # escribe 'duration <segundos>': OJO, esa directiva declara cuanto
+            # OCUPA EN EL TIEMPO el fichero anterior, no la longitud del hueco.
+            # Por eso se suma la duracion real del trozo mas los segundos caidos:
+            # asi el trozo siguiente entra desplazado y se conserva la sincronia.
+            filas = []
+            for i, t in enumerate(existentes):
+                filas.append(f"file '{t.name}'")
+                # Hueco que sigue a este trozo = el declarado para el siguiente.
+                hueco = g.huecos[i + 1] if i + 1 < len(g.huecos) else 0.0
+                if hueco > 0.1:   # por debajo de eso no compensa declararlo
+                    real = _duracion(t)
+                    if real > 0:
+                        filas.append(f"duration {real + hueco:.3f}")
+            lista.write_text("\n".join(filas) + "\n", encoding="utf-8")
+            r = subprocess.run(
+                # -fflags +genpts regenera los timestamps que falten. Con trozos
+                # bien cerrados la union ya sale limpia sin el; ayuda cuando el
+                # trozo anterior quedo a medias (proceso muerto sin cerrar el
+                # MKV, que es cuando aparecen avisos de dts no monotono).
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                 "-fflags", "+genpts",
+                 "-f", "concat", "-safe", "0", "-i", str(lista),
+                 "-c", "copy", str(unido)],
+                capture_output=True, text=True, errors="replace",
+                timeout=120, creationflags=_SIN_VENTANA,
+            )
+            if r.returncode == 0 and unido.exists() and unido.stat().st_size > 0:
+                for t in existentes:
+                    t.unlink(missing_ok=True)
+                unido.rename(existentes[0])   # el unido pasa a ser cam1.mkv
+                g.estado.fichero = existentes[0]
+            else:
+                unido.unlink(missing_ok=True)  # union fallida: quedan los trozos
+        except (OSError, subprocess.TimeoutExpired, FileNotFoundError):
+            # Cualquier fallo aqui deja los trozos sueltos, que son validos.
+            pass
+        finally:
+            lista.unlink(missing_ok=True)
+
     def detener_asalto(self) -> dict:
         """Para las tres camaras y deja escrito metadata.json.
 
@@ -542,11 +809,23 @@ class Sesion:
         if not self.asalto_actual:
             raise RuntimeError("No hay ningun asalto en curso")
 
-        # Secuencial y bloqueante: cada detener() espera a su FFmpeg. Son unos
-        # pocos segundos entre asaltos, y a cambio se garantiza que los tres
-        # ficheros estan cerrados y completos antes de escribir la metadata.
+        # En DOS pasadas, no una. Primero la 'q' a los tres seguida (es lo que
+        # fija el instante de corte), y solo despues se espera a que cierren.
+        # Haciendolo camara a camara, cada una seguia grabando mientras la
+        # anterior cerraba y las duraciones salian dispares (26/29/33 s reales);
+        # asi quedan a menos de un segundo.
         for g in self.grabadores:
-            g.detener()
+            g.pedir_parada()
+        # Bloqueante a proposito: garantiza que los tres ficheros estan cerrados
+        # y completos antes de componer la metadata.
+        for g in self.grabadores:
+            g.esperar_cierre()
+
+        # Con los ficheros ya cerrados, se unen los trozos de las camaras que se
+        # relanzaron. Es -c copy (instantaneo) y solo afecta a las que tengan
+        # mas de un trozo; el caso normal no paga nada.
+        for g in self.grabadores:
+            self._unir_trozos(g)
 
         info = self.asalto_actual
         fin = datetime.now()
@@ -572,6 +851,12 @@ class Sesion:
                     "formato": g.camara.formato if g.camara.configurada else None,
                     "fichero": g.estado.fichero.name if g.estado.fichero else None,
                     "frames": g.estado.frames,
+                    # >1 si la camara se cayo y el operador la relanzo. El video
+                    # resultante conserva la sincronia (el hueco se declara en la
+                    # linea de tiempo), pero ese tramo esta en negro.
+                    "intentos": len(g.trozos),
+                    # Segundos totales que la camara estuvo caida, 0 si ninguno.
+                    "segundos_caida": round(sum(g.huecos), 1),
                     # Un tamano de 0 delata una camara que no llego a grabar
                     # aunque no informara de ningun error.
                     "tamano_bytes": (

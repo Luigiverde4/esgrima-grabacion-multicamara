@@ -42,15 +42,26 @@ _ALTO_SUP = 720
 _ALTO_INF = _ALTO - _ALTO_SUP          # 360
 
 
-def _celda(idx: int, ancho: int, alto: int, etiqueta: str) -> str:
+def _celda(idx: int, ancho: int, alto: int, etiqueta: str, fps: int) -> str:
     """Escala una entrada a una celda 'ancho x alto' SIN deformar.
 
     force_original_aspect_ratio=decrease conserva la proporcion (una cam 16:9
     nunca se estira); el pad rellena con negro hasta el tamano exacto de la
     celda y centra la imagen. setsar=1 evita que overlay descoloque nada.
+
+    'fps={fps}' PRIMERO, antes de escalar, y aqui en cada entrada en vez de solo
+    al final: normaliza la cadencia de cada camara por separado. Es lo que salva
+    el caso de una camara relanzada, que llega con menos frames de los que
+    declara (huecos + perdidas por USB): sin esto, el overlay tiene que casar
+    entradas de cadencia muy distinta, el proceso se hincha a mas de 1 GB de RAM
+    y baja a ~0.4x de velocidad. Normalizando antes, cada rama entra ya a fps
+    constante y el overlay solo empareja frames uno a uno.
+
+    Ademas, escalar despues de fijar el fps evita escalar frames que luego se
+    descartan: con una camara a 12 fps efectivos eso es la mitad del trabajo.
     """
     return (
-        f"[{idx}:v]scale={ancho}:{alto}:force_original_aspect_ratio=decrease,"
+        f"[{idx}:v]fps={fps},scale={ancho}:{alto}:force_original_aspect_ratio=decrease,"
         f"pad={ancho}:{alto}:(ow-iw)/2:(oh-ih)/2,setsar=1[{etiqueta}];"
     )
 
@@ -63,20 +74,25 @@ def _filtro(frontal_idx: int, izq_idx: int, der_idx: int, fps: int) -> str:
     asi ninguna imagen se estira. El frontal (1280x720) se centra arriba; los
     laterales (960x360) llenan cada mitad inferior.
 
-    Dos detalles imprescindibles (ver bugs en el docstring del modulo):
+    Tres detalles imprescindibles (ver bugs en el docstring del modulo):
       - 'shortest=1' en el primer overlay: el fondo 'color' es infinito y sin
         esto el fichero sale sin duracion. Se corta a la entrada de video.
+      - 'eof_action=pass' en los overlays de los laterales: sin el, si una
+        camara es MAS CORTA que las otras (pasa al relanzarla tras una caida:
+        pierde el tramo caido), el overlay se queda esperando frames que no
+        llegan y el proceso se cuelga acumulando memoria en vez de terminar.
+        Con 'pass', al agotarse un lateral se sigue con lo que haya debajo.
       - 'fps={fps}' al final: fija el framerate real; sin el, FFmpeg pone 25.
     """
     x_frontal = (_ANCHO - 1280) // 2   # centra el frontal: 320
     return (
-        _celda(frontal_idx, 1280, _ALTO_SUP, "top")
-        + _celda(izq_idx, 960, _ALTO_INF, "bl")
-        + _celda(der_idx, 960, _ALTO_INF, "br")
+        _celda(frontal_idx, 1280, _ALTO_SUP, "top", fps)
+        + _celda(izq_idx, 960, _ALTO_INF, "bl", fps)
+        + _celda(der_idx, 960, _ALTO_INF, "br", fps)
         + f"color=c=black:s={_ANCHO}x{_ALTO}:r={fps}[bg];"
-        + f"[bg][top]overlay=x={x_frontal}:y=0:shortest=1[a];"
-        + f"[a][bl]overlay=x=0:y={_ALTO_SUP}[b];"
-        + f"[b][br]overlay=x=960:y={_ALTO_SUP},fps={fps}[out]"
+        + f"[bg][top]overlay=x={x_frontal}:y=0:shortest=1:eof_action=pass[a];"
+        + f"[a][bl]overlay=x=0:y={_ALTO_SUP}:eof_action=pass[b];"
+        + f"[b][br]overlay=x=960:y={_ALTO_SUP}:eof_action=pass,fps={fps}[out]"
     )
 
 

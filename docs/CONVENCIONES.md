@@ -88,6 +88,18 @@ patrón sintético `testsrc2` en lugar de capturadoras. Permite desarrollar el
 flujo completo (asaltos, metadata, mosaico, subida) sin hardware. Ver
 [FLUJO_DE_TRABAJO.md](FLUJO_DE_TRABAJO.md).
 
+## Tamaños en la lista de asaltos
+
+Cada asalto muestra lo que ocupa **toda su carpeta** (vídeos, mosaico y
+metadata), no solo los `.mkv`: lo que importa al mirar si cabe la jornada es el
+espacio real en disco. Bajo la lista hay un resumen con el número de asaltos, el
+total (en GB a partir de 1000 MB) y cuántos quedan sin subir.
+
+El tamaño entra en la firma de caché de `_pintar_lista()`. Sin él, el asalto en
+curso se pintaba una vez con 0 MB —la carpeta ya existe pero el `.mkv` acaba de
+crearse— y no se repintaba nunca más, porque el resto de la firma no cambiaba.
+→ `app.py`, `_tamano_mb()` / `_pintar_lista()` / `_actualizar_total()`.
+
 ## Colores de estado (GUI)
 
 Definidos en `app.py`, pensados para leerse de un vistazo desde lejos:
