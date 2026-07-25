@@ -8,7 +8,7 @@ Términos del dominio (esgrima y grabación) y del código.
 |---|---|
 | **Asalto** | Un combate de esgrima. Unidad de grabación: cada asalto es una carpeta con los tres vídeos y su metadata. |
 | **Jornada** | Un día de competición. Carpeta `DIA_NN` que agrupa los asaltos de ese día. La numeración de asaltos **no** reinicia por jornada. |
-| **Tiradores** | Los dos esgrimistas del asalto. Su nombre (opcional) va en el nombre de la carpeta. |
+| **Tiradores** | Los dos esgrimistas del asalto. Se identifican por número, que (opcional) va al principio del nombre de la carpeta: `12_47_ID_027`. |
 | **POV** | *Point of view*, cada uno de los tres ángulos de cámara (lateral izquierda, frontal, lateral derecha). |
 | **Mosaico** | Vídeo 1920x1080 que compone los tres POV: frontal grande arriba, los dos laterales abajo. |
 
@@ -31,7 +31,7 @@ Términos del dominio (esgrima y grabación) y del código.
 | `Camara` | grabador | Definición estática de una cámara (viene de config.json). Fuente de verdad al persistir. |
 | `GrabadorCamara` | grabador | Envuelve **un** proceso FFmpeg y vigila su salida. |
 | `EstadoCamara` | grabador | Estado vivo de una grabación; lo escribe el hilo lector, lo lee la GUI por sondeo. |
-| `EstadoCamara.bloqueada` | grabador | Propiedad que detecta imagen congelada (frames sin avanzar > 5 s). |
+| `EstadoCamara.bloqueada` | grabador | Propiedad que detecta imagen congelada (frames sin avanzar > `UMBRAL_CONGELADA_S`, 2 s). |
 | `_detencion_pedida` | grabador | Bandera: distingue una parada nuestra de una caída real de FFmpeg. |
 | `_RUIDO` | grabador | Lista de avisos benignos de FFmpeg que no deben marcarse como fallo. |
 | `Dispositivo` | dispositivos | Un dispositivo DirectShow: `nombre` visible + `id` de hardware (único). |
@@ -46,6 +46,6 @@ Términos del dominio (esgrima y grabación) y del código.
 
 - Identificadores **sin tildes ni eñes** (`tamano_bytes`, `SIN_SENAL`). Ver
   [CONVENCIONES.md](CONVENCIONES.md).
-- Prefijo `_` = privado del módulo/clase (`_entrada`, `_maximo_en_disco`,
+- Prefijo `_` = privado del módulo/clase (`_entrada`, `_carpeta_ocupada`,
   `_RE_JORNADA`).
 - Constantes en mayúsculas (`VERDE`, `MODO_PRUEBA`, `_ANCHO`, `_ALTO_SUP`).

@@ -29,49 +29,16 @@ from datetime import datetime
 from pathlib import Path
 
 import dispositivos
+import ffmpeg_utils
+from ffmpeg_utils import SIN_VENTANA as _SIN_VENTANA
 
-# En Windows, evita que se abra una ventana de consola por cada FFmpeg.
-_SIN_VENTANA = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
-
-
-def _duracion(fichero: Path) -> float:
-    """Segundos que dura un video, via ffprobe. 0.0 si no se puede saber.
-
-    Se pregunta a ffprobe en vez de fiarse del reloj porque lo que importa al
-    concatenar es la duracion REAL del contenedor. Devuelve 0.0 tambien cuando
-    el fichero quedo mal cerrado (duracion 'N/A'), y quien llama lo trata como
-    'no declarar hueco', que es lo prudente.
-    """
-    try:
-        salida = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "csv=p=0", str(fichero)],
-            capture_output=True, text=True, errors="replace",
-            timeout=15, creationflags=_SIN_VENTANA,
-        ).stdout.strip()
-        return float(salida)
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return 0.0
-
-
-def _muestra_audio(fichero: Path) -> int | None:
-    """Frecuencia de muestreo del audio principal via ffprobe.
-
-    Se usa al generar el tramo negro para que el silencio tenga el mismo
-    formato que el resto del asalto y el demuxer concat no tenga que mezclar
-    streams con distinta frecuencia.
-    """
-    try:
-        salida = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "a:0",
-             "-show_entries", "stream=sample_rate",
-             "-of", "csv=p=0", str(fichero)],
-            capture_output=True, text=True, errors="replace",
-            timeout=15, creationflags=_SIN_VENTANA,
-        ).stdout.strip()
-        return int(salida) if salida else None
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return None
+# Consultas de ffprobe: viven en ffmpeg_utils.py porque las comparte el mosaico.
+#
+# Al unir trozos se usa duracion_real (cuenta frames si el contenedor quedo mal
+# cerrado) y no duracion: un trozo cortado de golpe informa 'N/A', valdria 0 s y
+# el hueco negro saldria inflado por esos segundos. Ver _unir_trozos().
+_duracion = ffmpeg_utils.duracion_real
+_muestra_audio = ffmpeg_utils.muestra_audio
 
 
 @dataclass
@@ -109,6 +76,21 @@ class EstadoCamara:
     fichero: Path | None = None
     ultimo_avance: float = field(default_factory=time.monotonic)
 
+    # Segundos sin avance de frames antes de dar la camara por congelada.
+    #
+    # FFmpeg informa cada 0.5 s (-stats_period en comando()), asi que 2 s son
+    # tres informes perdidos. El valor sale de medir el hueco real entre
+    # informes: 0.52 s en reposo y 0.64 s con las 16 CPU saturadas. Dos
+    # segundos dejan margen para un informe retrasado suelto (un microcorte de
+    # USB, un pico de disco) sin encender la alarma.
+    #
+    # No bajarlo a 1 s sin volver a medir CON CAPTURADORAS REALES: en yuyv422 a
+    # 1080p el bus USB va justo (de ahi el aviso 'real-time buffer' de _RUIDO,
+    # que ya marco las tres camaras como caidas en un asalto valido). Una falsa
+    # alarma empuja al operador a relanzar, y relanzar sin motivo SI destruye
+    # valor: corta el trozo e inserta un hueco negro en una grabacion sana.
+    UMBRAL_CONGELADA_S = 2.0
+
     @property
     def bloqueada(self) -> bool:
         """Detecta la capturadora congelada: el fallo tipico del HDMI suelto.
@@ -122,7 +104,7 @@ class EstadoCamara:
         """
         if not self.grabando or self.frames == 0:
             return False
-        return (time.monotonic() - self.ultimo_avance) > 5.0
+        return (time.monotonic() - self.ultimo_avance) > self.UMBRAL_CONGELADA_S
 
 
 class GrabadorCamara:
@@ -194,7 +176,6 @@ class GrabadorCamara:
         # para que el video conserve la sincronia con las demas camaras.
         self.huecos: list[float] = []
         self._fin_trozo: float | None = None   # monotonic al morir el ultimo trozo
-        self._hueco_pendiente = 0.0            # hueco medido, aun sin asignar
 
     def _entrada(self) -> list[str]:
         """Argumentos de entrada segun sea testsrc o capturadora real."""
@@ -366,7 +347,6 @@ class GrabadorCamara:
             self.trozos = []
             self.huecos = []
             self.frames_previos = 0
-            self._hueco_pendiente = 0.0
             destino = carpeta / f"{self.camara.id}.mkv"
         else:
             # Se conservan los frames de los trozos anteriores para que el
@@ -381,14 +361,13 @@ class GrabadorCamara:
                 ultimo_evento = min(ultimo_evento, self._fin_trozo)
             hueco = max(0.0, time.monotonic() - ultimo_evento)
             # Se anota AQUI, alineado con el trozo que esta a punto de crearse.
-            # Antes se dejaba en _hueco_pendiente para que lo recogiera
+            # Hubo una version que lo dejaba apuntado para que lo recogiera
             # _leer_progreso() al cerrar el trozo anterior, pero ese trozo ya
-            # estaba cerrado: el valor se perdia y 'huecos' quedaba en [0.0],
-            # de modo que no se insertaba negro ninguno.
+            # estaba cerrado: el valor se perdia, 'huecos' quedaba en [0.0] y no
+            # se insertaba ningun negro.
             while len(self.huecos) < len(self.trozos):
                 self.huecos.append(0.0)
             self.huecos.append(hueco)
-            self._hueco_pendiente = 0.0
             destino = self._siguiente_libre(carpeta)
 
         # Estado nuevo en cada arranque: arrastrar el anterior mostraria en la
@@ -420,8 +399,8 @@ class GrabadorCamara:
         # el ejecutable existe; FFmpeg puede morir un instante despues sin haber
         # creado el fichero (p.ej. 'I/O error' al abrir una capturadora con un
         # modo inexistente). Anotarlo aqui inflaba el contador de intentos con
-        # arranques que no grabaron nada. Se anota en _cerrar_trozo(), cuando ya
-        # se sabe si dejo fichero con contenido.
+        # arranques que no grabaron nada. Se anota al final de _leer_progreso(),
+        # cuando el proceso ya ha muerto y se sabe si dejo fichero con contenido.
 
         # daemon=True: si la aplicacion se cierra de golpe, estos hilos no
         # impiden que el proceso Python termine.
@@ -560,20 +539,18 @@ class Sesion:
         self.grabadores: list[GrabadorCamara] = []
         self.asalto_actual: dict | None = None
 
-        # Ultimo desajuste detectado entre el contador de config.json y lo que
-        # hay grabado, o None si van acordes. Lo escribe siguiente_numero() y lo
-        # lee la interfaz para avisar. Se guarda en vez de avisar desde aqui
-        # porque este modulo no sabe que existe una GUI.
-        self.contador_ignorado: tuple[int, int] | None = None
-
     # Dias de la semana en mayusculas, indexados por datetime.weekday().
     _DIAS = ("LUNES", "MARTES", "MIERCOLES", "JUEVES", "VIERNES", "SABADO", "DOMINGO")
 
-    # Carpetas que cuentan como jornada (MIERCOLES_22) y como asalto (007_...).
-    # Se exigen exactamente 3 digitos para el asalto: asi una carpeta creada a
-    # mano no puede alterar el contador.
+    # Carpetas que cuentan como jornada (MIERCOLES_22).
     _RE_JORNADA = re.compile(rf"^(?:{'|'.join(_DIAS)})_\d{{2}}$")
-    _RE_ASALTO = re.compile(r"^(\d{3})(?:_|$)")
+
+    # Carpeta de asalto: el ID va al FINAL, tras el marcador literal '_ID_'
+    # (12_47_ID_027). El marcador evita la ambiguedad que habria entre campos
+    # numericos separados por '_': con los tiradores delante, '12_47_027' no
+    # permite saber cual de los tres numeros es el asalto. Se usa para detectar
+    # colisiones al crear la carpeta, no para numerar (ver siguiente_numero).
+    _RE_ASALTO = re.compile(r"(?:^|_)ID_(\d{3})$")
 
     @classmethod
     def carpeta_dia(cls, momento: datetime | None = None) -> str:
@@ -584,50 +561,42 @@ class Sesion:
     def siguiente_numero(self) -> int:
         """Numero que se asignara al proximo asalto.
 
-        El contador vive en config.json ('ultimo_asalto'), de modo que no
-        depende de como se llamen las carpetas del disco: renombrarlas o
-        moverlas ya no altera la numeracion.
+        El contador vive UNICAMENTE en config.json ('ultimo_asalto'). No se
+        contrasta con las carpetas del disco: config.json es el punto unico de
+        control, de modo que reiniciar o corregir la numeracion es editar un
+        numero en un fichero y nada mas. Renombrar o mover carpetas no afecta.
 
-        Aun asi se contrasta con lo que hay grabado y se toma el mayor de los
-        dos. Es una red de seguridad: si config.json se pierde o se restaura una
-        copia antigua, un contador atrasado sobrescribiria asaltos ya grabados.
-
-        Consecuencia de ese max(): el contador solo puede SUBIR. Bajarlo a mano
-        en config.json no renumera nada mientras queden grabaciones mas altas en
-        disco; para renumerar hay que archivar antes esas jornadas. Cuando el
-        disco manda se anota en self.contador_ignorado para que la interfaz lo
-        avise: en silencio es indistinguible de un fallo al guardar.
+        Contrapartida asumida: si config.json se pierde o se restaura una copia
+        antigua, el contador retrocede y el proximo asalto reutilizaria un
+        numero ya usado. Contra eso protege iniciar_asalto(), que se niega a
+        escribir dentro de una carpeta que ya contiene una grabacion y busca el
+        siguiente numero libre. Es decir: el contador decide, pero nunca puede
+        destruir material grabado.
         """
-        guardado = int(self.cfg.get("ultimo_asalto", 0))
-        en_disco = self._maximo_en_disco()
-        self.contador_ignorado = (guardado, en_disco) if en_disco > guardado else None
-        return max(guardado, en_disco) + 1
+        return int(self.cfg.get("ultimo_asalto", 0)) + 1
 
-    def _maximo_en_disco(self) -> int:
-        """Mayor numero de asalto presente en las carpetas ya grabadas.
+    def _carpeta_ocupada(self, jornada: Path, numero: int) -> bool:
+        """True si ya hay una grabacion con ese numero en esa jornada.
 
-        Recorre las jornadas (MIERCOLES_22/) buscando carpetas NNN o NNN_...
-        Solo se usa como respaldo de 'ultimo_asalto'.
+        Se busca por el ID del final del nombre ('..._ID_027'), no por el nombre
+        completo, porque los tiradores del nuevo asalto no tienen por que
+        coincidir con los del que ya existe: '12_47_ID_027' y '3_9_ID_027' son
+        el mismo numero de asalto y colisionarian igual.
 
-        No basta con que el nombre parezca un asalto: se exige ademas que la
-        carpeta contenga metadata.json, que solo escribe esta aplicacion al
-        terminar una grabacion. Sin esa comprobacion, una carpeta creada a mano
-        como "500_revisar" dispararia el contador a 501 y dejaria un hueco
-        enorme en la numeracion.
+        Solo cuenta como ocupada si hay metadata.json: lo escribe esta
+        aplicacion al terminar de grabar, asi que su presencia significa que ahi
+        dentro hay material. Una carpeta vacia (creada y abandonada por un
+        arranque fallido) no bloquea el numero.
         """
-        if not self.raiz.exists():
-            return 0
-
-        maximo = 0
-        for jornada in self.raiz.iterdir():
-            if not jornada.is_dir() or not self._RE_JORNADA.match(jornada.name):
+        if not jornada.exists():
+            return False
+        for carpeta in jornada.iterdir():
+            if not carpeta.is_dir() or not (carpeta / "metadata.json").exists():
                 continue
-            for asalto in jornada.iterdir():
-                if not asalto.is_dir() or not (asalto / "metadata.json").exists():
-                    continue
-                if m := self._RE_ASALTO.match(asalto.name):
-                    maximo = max(maximo, int(m.group(1)))
-        return maximo
+            if m := self._RE_ASALTO.search(carpeta.name):
+                if int(m.group(1)) == numero:
+                    return True
+        return False
 
     def _actualizar_config(self, cambios: dict) -> None:
         """Aplica 'cambios' a config.json releyendolo antes de escribir.
@@ -648,7 +617,11 @@ class Sesion:
             )
         except OSError:
             # Si no se puede escribir (fichero bloqueado, disco lleno), no se
-            # interrumpe: para el contador, _maximo_en_disco() cubre el hueco.
+            # interrumpe la grabacion: perder un ajuste es menos grave que no
+            # grabar. Para el contador significa que el numero no queda
+            # reservado y el proximo asalto volveria a calcularlo igual; de que
+            # no pise lo ya grabado se encarga la comprobacion de colision de
+            # iniciar_asalto().
             pass
 
     def _guardar_contador(self, numero: int) -> None:
@@ -716,6 +689,12 @@ class Sesion:
         volver la camara a modo prueba. Al asignar video se autoempareja su
         micro; si se quita el video, tambien se quita el audio (no tiene sentido
         grabar solo el micro). La eleccion manual de micro va en guardar_audio().
+
+        Si el micro que sale del emparejado ya lo tiene otra camara, se deja sin
+        audio en vez de duplicarlo: con capturadoras identicas el emparejado va
+        por nombre y puede devolver el mismo micro para dos camaras. Mejor una
+        camara muda (visible en la interfaz, se corrige a mano) que dos apuntando
+        al mismo micro, que en directo pasa desapercibido.
         """
         if audios is None:
             audios = dispositivos.listar_audio()
@@ -727,7 +706,9 @@ class Sesion:
                 cam.dispositivo = dispositivo.id
                 cam.dispositivo_nombre = dispositivo.nombre
                 micro = dispositivos.emparejar_audio(dispositivo, audios)
-                cam.audio = micro.id if micro else None
+                ocupados = {c.audio for c in self.camaras
+                            if c.id != cam_id and c.audio}
+                cam.audio = micro.id if micro and micro.id not in ocupados else None
             else:
                 cam.dispositivo = None
                 cam.dispositivo_nombre = None
@@ -752,13 +733,19 @@ class Sesion:
     def _limpiar(texto: str) -> str:
         """Convierte el texto de tiradores en un nombre de carpeta valido.
 
-        El operador escribe libremente ("Garcia vs Lopez") y eso acaba siendo
-        un nombre de carpeta que ademas viaja a OneDrive.
+        El operador escribe libremente ("12 47", o "Garcia vs Lopez") y eso
+        acaba siendo un nombre de carpeta que ademas viaja a Dropbox.
 
         Con flags=UNICODE, \\w conserva letras acentuadas y enes: se quitan los
         signos problematicos (/ \\ : * ? " < > |) pero no se destroza el nombre.
-        Los separadores pasan a '_' para encajar con ID_NOMBRE1_NOMBRE2, y se
-        corta a 60 caracteres para no acercarse al limite de ruta de Windows.
+        Los separadores (espacios y guiones) pasan a '_', de modo que los dos
+        numeros de tirador salen ya como '12_47' sin pedirle al operador ningun
+        formato concreto. Se corta a 60 caracteres para no acercarse al limite
+        de ruta de Windows.
+
+        No se valida que sean numeros a proposito: en directo, un campo que
+        rechaza lo que se teclea es un obstaculo, y el ID final identifica el
+        asalto pase lo que pase en esta parte del nombre.
         """
         limpio = re.sub(r"[^\w\s-]", "", texto, flags=re.UNICODE).strip()
         return re.sub(r"[\s-]+", "_", limpio)[:60].strip("_")
@@ -777,14 +764,31 @@ class Sesion:
             raise RuntimeError("Ya hay un asalto en curso")
 
         inicio = datetime.now()
-        numero = self.siguiente_numero()
-
-        # ID_NOMBRE1_NOMBRE2 (solo el ID si no se indicaron tiradores),
-        # dentro de la carpeta de la jornada: MIERCOLES_22/007_Garcia_Lopez
-        sufijo = self._limpiar(etiqueta)
-        nombre = f"{numero:03d}" + (f"_{sufijo}" if sufijo else "")
+        numero = previsto = self.siguiente_numero()
         jornada = self.carpeta_dia(inicio)
-        carpeta = self.raiz / jornada / nombre
+
+        # Red de seguridad del punto unico de control: si config.json se
+        # restauro atrasado, el numero calculado puede estar ya grabado. Se
+        # avanza hasta el primer libre en vez de escribir encima (mkdir con
+        # exist_ok=True no falla: grabaria dentro y pisaria los .mkv). El limite
+        # solo evita un bucle infinito si algo va muy mal.
+        #
+        # Se conserva 'previsto' para que la interfaz pueda avisar del salto:
+        # una numeracion que da un brinco sin explicacion parece un fallo de la
+        # aplicacion, cuando lo que hay es un config.json desfasado.
+        raiz_jornada = self.raiz / jornada
+        for _ in range(1000):
+            if not self._carpeta_ocupada(raiz_jornada, numero):
+                break
+            numero += 1
+
+        # TIRADOR1_TIRADOR2_ID_NNN, dentro de la carpeta de la jornada:
+        # MIERCOLES_22/12_47_ID_027. El ID va al final para que no se confunda
+        # con los numeros de tirador que escribe el operador; el marcador '_ID_'
+        # lo delimita sin ambiguedad. Sin tiradores queda solo ID_027.
+        sufijo = self._limpiar(etiqueta)
+        nombre = (f"{sufijo}_" if sufijo else "") + f"ID_{numero:03d}"
+        carpeta = raiz_jornada / nombre
         carpeta.mkdir(parents=True, exist_ok=True)
 
         # El contador se guarda al iniciar, no al terminar: si la aplicacion
@@ -799,6 +803,7 @@ class Sesion:
 
         self.asalto_actual = {
             "numero": numero,
+            "numero_previsto": previsto,   # != numero si hubo colision
             "etiqueta": etiqueta,
             "carpeta": carpeta,
             "jornada": jornada,
@@ -852,6 +857,10 @@ class Sesion:
 
         Devuelve 0.0 si todas las camaras se cayeron: entonces no hay referencia
         y _unir_trozos() se queda con lo medido por reloj, que es mejor que nada.
+
+        Solo cuentan las camaras de UN trozo: son las que grabaron el asalto de
+        principio a fin y por tanto miden lo que duro de verdad. Una camara con
+        varios trozos aun no esta unida y su duracion no significa nada todavia.
         """
         duraciones = [
             _duracion(g.trozos[0])
@@ -1001,7 +1010,7 @@ class Sesion:
         fin = datetime.now()
         duracion = (fin - info["inicio"]).total_seconds()
 
-        # metadata.json acompana a los videos hasta OneDrive: es el registro de
+        # metadata.json acompana a los videos hasta Dropbox: es el registro de
         # que se grabo, cuanto duro y si hubo incidencias en alguna camara.
         metadata = {
             "competicion": self.cfg["competicion"],
@@ -1044,7 +1053,7 @@ class Sesion:
         )
 
         # La carpeta se anade al dict devuelto (no al JSON: es una ruta local que
-        # no tiene sentido subir a OneDrive). La usa la app para el mosaico.
+        # no tiene sentido subir a Dropbox). La usa la app para el mosaico.
         resultado = dict(metadata, carpeta=str(info["carpeta"]))
 
         # Sesion queda libre para el siguiente asalto.

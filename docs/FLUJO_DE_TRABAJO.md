@@ -21,7 +21,7 @@ Sin dependencias externas de Python (solo stdlib). Requiere `ffmpeg`, `ffprobe`,
    `metadata.json` y, si las tres cámaras grabaron bien, se lanza el **mosaico**
    en una ventana aparte. Si alguna cámara falló, salta un aviso modal.
 4. **Repetir** para cada asalto. La numeración es continua toda la competición.
-5. **Subir** al final del día: **Subir todo a OneDrive**.
+5. **Subir** al final del día: **Subir todo a Dropbox**.
 
 ## Preparación de dispositivos (detalle)
 
@@ -35,6 +35,15 @@ Sin dependencias externas de Python (solo stdlib). Requiere `ffmpeg`, `ffprobe`,
   (`guardar_formato`): MJPEG (default), YUYV o Auto.
 - El formato y el audio solo aplican con capturadora real; en modo prueba sus
   combos quedan deshabilitados.
+- **Lo ya asignado no se ofrece al resto.** Un dispositivo (vídeo o micro) que
+  ya tiene otra cámara desaparece de los desplegables de las demás: quedan solo
+  los libres, que es lo que el operador busca, y no se puede duplicar por
+  descuido. Cada cámara sigue viendo su propia elección. No se filtran el modo
+  prueba ni "sin audio": no son dispositivos y pueden repetirse.
+- Tras cada asignación se repintan los combos con `_repintar_combos()`, que usa
+  los mapas ya en memoria. No se reenumera con FFmpeg: eso bloquea la interfaz
+  un instante y los dispositivos conectados no han cambiado. Reenumerar es cosa
+  de **↻ Refrescar lista** (`_refrescar_dispositivos`).
 
 ## Si una cámara se cae a mitad de asalto
 
@@ -73,16 +82,18 @@ cuentan los arranques que no grabaron nada).
 ## Ciclo de un asalto (motor)
 
 `Sesion.iniciar_asalto(etiqueta)`:
-1. Calcula el número (`siguiente_numero()`) y crea la carpeta
-   `grabaciones/JORNADA/NNN_ETIQUETA/`.
+1. Calcula el número (`siguiente_numero()`), lo avanza si ya estuviera grabado, y
+   crea la carpeta `grabaciones/JORNADA/ETIQUETA_ID_NNN/`.
 2. **Guarda el contador en config.json inmediatamente** (al iniciar, no al
    terminar): si la app muere, el número queda reservado.
 3. Crea un `GrabadorCamara` por cámara y los arranca **secuencialmente** (~1 s de
    desfase). Cada uno lanza FFmpeg + un hilo lector de progreso.
 
 `Sesion.detener_asalto()`:
-1. Llama a `detener()` de cada grabador, **secuencial y bloqueante**: cada uno
-   espera a que su FFmpeg cierre el MKV con la duración escrita.
+1. **Dos pasadas**: primero `pedir_parada()` en las tres cámaras (envía la `q`,
+   que es lo que fija el instante de corte), y solo después `esperar_cierre()`
+   en las tres. Así los tres MKV se cierran con duraciones a menos de un
+   segundo; camara a camara salían dispares.
 2. Compone y escribe `metadata.json` (incluye por cámara: fichero, frames,
    tamaño en bytes, error). Un `tamano_bytes` de 0 delata una cámara que no
    grabó aunque no informara error.
@@ -93,14 +104,16 @@ cuentan los arranques que no grabaron nada).
 
 - La numeración es **continua** durante toda la competición; **no** reinicia por
   jornada.
-- El contador vive en `config.json` (`ultimo_asalto`). Renombrar o mover carpetas
-  no lo altera.
-- `siguiente_numero()` toma el **mayor** entre el contador guardado y
-  `_maximo_en_disco()`. Esta última es una red de seguridad: si `config.json` se
-  pierde o se restaura una copia antigua, un contador atrasado sobrescribiría
-  asaltos ya grabados.
-- `_maximo_en_disco()` solo cuenta una carpeta si cumple **las tres**
-  condiciones: jornada válida, nombre `NNN`, y **`metadata.json` presente**. Ver
+- El contador vive **solo** en `config.json` (`ultimo_asalto`).
+  `siguiente_numero()` devuelve `ultimo_asalto + 1` y no mira el disco:
+  renombrar o mover carpetas no lo altera.
+- **Para reiniciar o corregir la numeración**, edita `ultimo_asalto` en
+  `config.json` con la aplicación cerrada. El siguiente asalto será ese número
+  + 1. Es el único sitio que hay que tocar.
+- **Protección contra sobrescritura:** si el número calculado ya está grabado en
+  esa jornada (pasa al restaurar un `config.json` antiguo), `iniciar_asalto()`
+  avanza al primer número libre en vez de grabar encima, y lo registra en el log.
+  Una carpeta solo cuenta como ocupada si tiene `metadata.json`. Ver
   [DECISIONES.md](DECISIONES.md).
 
 ## Modo prueba
@@ -125,7 +138,7 @@ la app sigue sin registro en disco, nunca cae por esto (`_escribir()` traga el
 `OSError`). Ver `_abrir_log()` / `_escribir()` en `app.py`. La carpeta `logs/`
 está en `.gitignore` (material de trabajo).
 
-## Subida a OneDrive
+## Subida a Dropbox
 
 - **Pensada para el final del día.** `_subir()` recorre `grabaciones/*/*` (todos
   los asaltos de todas las jornadas) y lanza `rclone copy` en un hilo.
@@ -138,7 +151,7 @@ está en `.gitignore` (material de trabajo).
 
 ### Subida selectiva
 
-Además de **"Subir todo a OneDrive"**, la lista de asaltos permite elegir cuáles
+Además de **"Subir todo a Dropbox"**, la lista de asaltos permite elegir cuáles
 subir: se marcan con **Ctrl/Shift+clic** (`selectmode="extended"`) y se pulsa
 **"Subir seleccionados"** (deshabilitado mientras no haya selección). El resto
 del flujo —confirmación, bloqueo de botones, progreso— es común a ambos botones
@@ -158,10 +171,10 @@ dentro de cada carpeta subida (`_marcar_subidas`). En la lista, esos asaltos
 aparecen con un **`✓` verde** al inicio (`_pintar_lista` + `itemconfig`). Sirve
 para no resubir por error y ver de un vistazo qué queda pendiente.
 
-- Es una marca **local** ("lo subí desde esta app"), no una consulta a OneDrive.
+- Es una marca **local** ("lo subí desde esta app"), no una consulta a Dropbox.
 - Solo se marca si la subida terminó OK; una subida fallida a medias no marca nada.
 - El `.subido` se **excluye** de la subida (`--exclude .subido` en `subida.py`):
-  es estado local, no debe viajar a OneDrive.
+  es estado local, no debe viajar a Dropbox.
 - Vive dentro de la carpeta del asalto (que está en `grabaciones/`, ignorada por
   git). No se mezcla con `metadata.json`.
 

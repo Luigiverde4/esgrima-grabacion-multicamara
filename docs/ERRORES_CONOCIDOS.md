@@ -161,8 +161,15 @@ bien.
   debería estar filtrado por `_RUIDO` en `grabador.py`. Si aparece uno nuevo,
   añadirlo **con cuidado de no tapar fallos reales**.
 - Parada nuestra confundida con caída → cubierto por `_detencion_pedida`.
-- "SIN SEÑAL - imagen congelada" (ámbar): frames sin avanzar > 5 s. Suele ser
-  **HDMI suelto real**, no falsa alarma. Verificar el cable antes de descartar.
+- "SIN SEÑAL - imagen congelada" (ámbar): frames sin avanzar > 2 s
+  (`UMBRAL_CONGELADA_S`). Suele ser **HDMI suelto real**, no falsa alarma.
+  Verificar el cable antes de descartar.
+
+  Si aparece de forma intermitente en cámaras que **siguen grabando bien** (el
+  contador de frames se reanuda solo y el `.mkv` sale correcto), es que el
+  umbral se ha quedado corto para ese hardware: revisar el hueco real entre
+  informes antes de tocar nada, y ver el apartado del umbral en
+  [DECISIONES.md](DECISIONES.md). No relanzar por un ámbar que se apaga solo.
 
 Ver [DECISIONES.md](DECISIONES.md), sección Grabación.
 
@@ -176,6 +183,22 @@ Ver [DECISIONES.md](DECISIONES.md), sección Grabación.
   frames por ancho de banda USB (ver el `I/O error` de YUV arriba). Comprobar
   con `ffprobe` que los `pts_time` son continuos; si lo son, es solo desfase de
   arranque (inofensivo).
+
+### Comprobación tras un asalto con cámara relanzada
+
+Cuando se ha pulsado **⟳ Relanzar** durante un asalto, esa cámara se grabó en
+trozos que luego se unieron con negro en medio. Merece la pena comprobar que la
+unión cuadró — **no hace falta entender el código**, basta comparar duraciones:
+
+```
+for %f in (cam1 cam2 cam3) do @ffprobe -v error -show_entries format=duration -of csv=p=0 "grabaciones\JORNADA\ASALTO\%f.mkv"
+```
+
+**Las tres deben parecerse (menos de ~1 s de diferencia).** Si la cámara
+relanzada sale **más larga** que las sanas, el hueco negro se calculó de más;
+si sale **más corta**, de menos. En ambos casos el mosaico quedará descuadrado
+y conviene revisarlo antes de seguir. Ver la entrada de `duracion_real()` en
+[DECISIONES.md](DECISIONES.md), que es el fallo que producía justo eso.
 
 ## rclone: subida fallida
 

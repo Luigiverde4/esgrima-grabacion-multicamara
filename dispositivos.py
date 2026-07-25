@@ -13,7 +13,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 
-_SIN_VENTANA = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+from ffmpeg_utils import SIN_VENTANA as _SIN_VENTANA
 
 # Cada dispositivo son dos lineas: '"Nombre" (video)' y, debajo, su
 # 'Alternative name "<id>"'. El id es el identificador unico de FFmpeg (para las

@@ -6,7 +6,7 @@ El código, los comentarios, los nombres de identificadores y la interfaz están
 en **español**. Mantener esa convención.
 
 Los identificadores **evitan tildes y eñes** (`tamano_bytes`, `SIN_SENAL`,
-`_maximo_en_disco`) para no depender de la codificación del terminal. En cambio,
+`_segmento_negro`) para no depender de la codificación del terminal. En cambio,
 el texto que se muestra al operador y los datos (nombres de tiradores, etiquetas)
 sí llevan acentos: los ficheros se leen/escriben con `encoding="utf-8"` y los
 JSON con `ensure_ascii=False`.
@@ -25,8 +25,10 @@ JSON con `ensure_ascii=False`.
 
 - **Jornada**: `DIA_NN` en mayúsculas sin tilde — `MIERCOLES_22`, `SABADO_04`.
   Generado por `Sesion.carpeta_dia()`. Regex de validación: `_RE_JORNADA`.
-- **Asalto**: `NNN_NOMBRE1_NOMBRE2` — `007_Garcia_Lopez`. Solo el `NNN` si no se
-  indicaron tiradores. Tres dígitos obligatorios. Regex: `_RE_ASALTO`.
+- **Asalto**: `TIRADOR1_TIRADOR2_ID_NNN` — `12_47_ID_027`. El ID va al **final**,
+  tras el marcador literal `_ID_`, para no confundirse con los números de
+  tirador. Solo `ID_NNN` si no se indicaron tiradores. Tres dígitos
+  obligatorios. Regex: `_RE_ASALTO`. Ver [DECISIONES.md](DECISIONES.md).
 - **Ficheros de cámara**: `cam1.mkv`, `cam2.mkv`, `cam3.mkv` (el `id` de cada
   `Camara`).
 - **Mosaico**: `mosaico.mkv` (y `mosaico.parcial.mkv` mientras se genera).
@@ -45,9 +47,9 @@ Fuente de configuración y de estado persistente. Campos:
 {
   "modo_prueba": false,                    // derivado: true si ninguna cámara configurada
   "carpeta_grabaciones": "grabaciones",
-  "rclone_destino": "personal:ESGRIMA_26", // remoto:carpeta de rclone
-  "competicion": "ESGRIMA_26",
-  "ultimo_asalto": 26,                     // contador continuo (ver FLUJO_DE_TRABAJO.md)
+  "rclone_destino": "dropbox:Valencia_Fencing_2026", // remoto:carpeta de rclone
+  "competicion": "Valencia_Fencing_2026",
+  "ultimo_asalto": 26,                     // contador continuo; UNICA fuente de la numeracion
   "video": {
     "resolucion": "1920x1080",
     "fps": 30,

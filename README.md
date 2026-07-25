@@ -1,7 +1,7 @@
 # ESGRIMA_26 — Grabación multicámara de asaltos
 
 Soporte de grabación para una competición de esgrima: tres cámaras sobre la pista,
-un fichero por POV y asalto, y subida a OneDrive al terminar el evento.
+un fichero por POV y asalto, y subida a Dropbox al terminar el evento.
 
 ## Uso
 
@@ -9,10 +9,11 @@ un fichero por POV y asalto, y subida a OneDrive al terminar el evento.
 python app.py
 ```
 
-1. Escribir los tiradores (opcional) y pulsar **INICIAR ASALTO**.
+1. Escribir los dos números de tirador separados por un espacio — `12 47`
+   (opcional) — y pulsar **INICIAR ASALTO**.
 2. Pulsar **DETENER ASALTO** al acabar.
 3. Repetir. La numeración es automática y continúa aunque se reinicie la aplicación.
-4. Al terminar la jornada, **Subir todo a OneDrive**.
+4. Al terminar la jornada, **Subir todo a Dropbox**.
 
 Durante la grabación, cada cámara muestra un indicador:
 
@@ -28,12 +29,12 @@ velocidad, tiempo restante) se actualizan cada segundo.
 
 ## Estructura resultante
 
-Se replica tal cual en `personal:ESGRIMA_26`:
+Se replica tal cual en `dropbox:Valencia_Fencing_2026`:
 
 ```
 grabaciones/
   MIERCOLES_22/                 carpeta de la jornada
-    001_Garcia_Lopez/           ID_NOMBRE1_NOMBRE2
+    12_47_ID_027/               TIRADOR1_TIRADOR2_ID_NNN (el ID va al final)
       cam1.mkv                  Lateral izquierda
       cam2.mkv                  Frontal
       cam3.mkv                  Lateral derecha
@@ -73,7 +74,7 @@ numeración no retrocede sobre material ya grabado.
 - `camaras[].dispositivo` — `null` activa el modo prueba (patrón `testsrc2`,
   sin necesidad de hardware). Se elige desde la interfaz con el desplegable de
   cada cámara; la elección se guarda aquí y persiste entre sesiones.
-- `rclone_destino` — `personal:ESGRIMA_26`.
+- `rclone_destino` — `dropbox:Valencia_Fencing_2026`.
 
 En el recuadro **Cámaras**, cada fila tiene un desplegable para elegir su
 dispositivo (o dejarla en modo prueba) y un botón **Ver** que abre una ventana
@@ -96,6 +97,11 @@ Cada cámara HDMI trae su propio micro. Al elegir una capturadora, su micro se
 idénticas. El segundo desplegable (**micro**) de cada cámara permite cambiarlo a
 mano o ponerlo en *sin audio*. El audio se graba en el mismo MKV, en AAC. Durante
 la grabación, las cámaras con audio muestran un ♪.
+
+Los desplegables **solo ofrecen lo que está libre**: la capturadora y el micro
+que ya usa otra cámara no aparecen en el resto. Si el autoemparejado apunta a un
+micro que ya tiene otra cámara, esa cámara se queda *sin audio* en vez de
+duplicarlo — se ve al momento en la interfaz y se corrige a mano.
 
 ## Decisiones de diseño
 
@@ -133,6 +139,7 @@ Vamos a montar una pista con cámaras (mínimo 3) para grabar distintos asaltos.
 
 La idea es iniciar a grabar cuando se inicie un asalto y parar la grabación cuando termine.
 
-Mandar a través de RCLONE a una carpeta en OneDrive. En esa carpeta, tener carpetas
+Mandar a través de RCLONE a una carpeta en Dropbox. En esa carpeta, tener carpetas
 individuales por asalto para tener los tres POVs.
-En RCLONE es el sitio de "personal:" y la carpeta está en la raíz "ESGRIMA_26"
+El destino se configura en `config.json` (`rclone_destino`), con el formato
+`remoto:carpeta` de rclone — actualmente `dropbox:Valencia_Fencing_2026`.

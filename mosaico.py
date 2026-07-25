@@ -29,50 +29,21 @@ BUGS DEL FILTRO QUE HABIA QUE EVITAR (ver historial):
 import subprocess
 from pathlib import Path
 
-# Consola propia y visible para el mosaico. En Windows, CREATE_NEW_CONSOLE abre
-# una ventana donde FFmpeg pinta su progreso; el operador ve como avanza y se
-# cierra sola al terminar. Fuera de Windows (desarrollo) queda a 0 y hereda la
-# consola actual.
-_NUEVA_CONSOLA = subprocess.CREATE_NEW_CONSOLE if hasattr(subprocess, "CREATE_NEW_CONSOLE") else 0
+import ffmpeg_utils
+from ffmpeg_utils import NUEVA_CONSOLA as _NUEVA_CONSOLA
+
+# Consultas de ffprobe compartidas con el grabador. Van SIN ventana (dentro de
+# ffmpeg_utils): son instantaneas y no pintan nada, asi que abrirles una consola
+# solo producia parpadeos de ventanas negras antes de la del mosaico. La consola
+# visible es la de FFmpeg, mas abajo, que es la que el operador quiere ver.
+_duracion = ffmpeg_utils.duracion
+_tiene_audio = ffmpeg_utils.tiene_audio
 
 # Lienzo y geometria. El frontal ocupa la franja superior (720 de alto), los
 # laterales se reparten la inferior (360 de alto) a partes iguales.
 _ANCHO, _ALTO = 1920, 1080
 _ALTO_SUP = 720
 _ALTO_INF = _ALTO - _ALTO_SUP          # 360
-
-
-def _tiene_audio(fichero: Path) -> bool:
-  """True si el fichero de entrada contiene al menos una pista de audio."""
-  try:
-    salida = subprocess.run(
-      [
-        "ffprobe", "-v", "error",
-        "-select_streams", "a:0",
-        "-show_entries", "stream=index",
-        "-of", "csv=p=0",
-        str(fichero),
-      ],
-      capture_output=True, text=True, errors="replace", timeout=15,
-      creationflags=_NUEVA_CONSOLA,
-    ).stdout.strip()
-    return bool(salida)
-  except (FileNotFoundError, subprocess.TimeoutExpired):
-    return False
-
-
-def _duracion(fichero: Path) -> float:
-    """Segundos que dura un video, via ffprobe. 0.0 si no se puede saber."""
-    try:
-        salida = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "csv=p=0", str(fichero)],
-            capture_output=True, text=True, errors="replace", timeout=15,
-            creationflags=_NUEVA_CONSOLA,
-        ).stdout.strip()
-        return float(salida)
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return 0.0
 
 
 def _celda(idx: int, ancho: int, alto: int, etiqueta: str, fps: int) -> str:
@@ -212,18 +183,35 @@ def generar(carpeta: Path, frontal: str, izquierda: str, derecha: str,
         args_ffmpeg += ["-map", f"{idx_audio}:a?", "-c:a", "aac", "-b:a", "160k"]
     args_ffmpeg.append(f'"{parcial}"')
 
-    partes = [
-        *args_ffmpeg,
-    ]
     bat = carpeta / "_mosaico.bat"
+
+    # El cierre del .bat es delicado y esta medido, no adivinado:
+    #
+    # Un 'del "<el propio bat>"' a secas hace que cmd borre el fichero que aun
+    # esta leyendo; al ir a por la linea siguiente ya no existe, imprime "The
+    # batch file cannot be found" y SALE CON CODIGO 1 aunque todo haya ido bien.
+    # El mosaico salia correcto, pero el proceso se declaraba fallido: quien
+    # mirara returncode veria un fallo inexistente (o, peor, tomaria por bueno
+    # el 1 y dejaria de distinguir el fallo real).
+    #
+    # '(goto) 2>nul' cierra el contexto del batch antes de borrar, y el
+    # 'exit /b %CODIGO%' devuelve el codigo guardado. Comprobado con las cuatro
+    # combinaciones (exito/fallo x borrado/no borrado): es la unica forma que
+    # da 0 al terminar bien, distinto de 0 al fallar, y borra el .bat siempre.
+    #
+    # %CODIGO% se captura DESPUES de cada paso porque 'if errorlevel' no lo
+    # conserva: sin guardarlo, el codigo que llega al final es el del ultimo
+    # comando ejecutado (el propio del), no el de FFmpeg.
     contenido = (
         "@echo off\r\n"
         f"title Mosaico {carpeta.name}\r\n"
-        f"{' '.join(partes)}\r\n"
-        "if errorlevel 1 goto :fin\r\n"
-        f'move /Y "{parcial}" "{destino}"\r\n'
+        f"{' '.join(args_ffmpeg)}\r\n"
+        "set CODIGO=%errorlevel%\r\n"
+        "if not %CODIGO%==0 goto :fin\r\n"
+        f'move /Y "{parcial}" "{destino}" >nul\r\n'
+        "set CODIGO=%errorlevel%\r\n"
         ":fin\r\n"
-        f'del "{bat.resolve()}"\r\n'
+        f'endlocal & (goto) 2>nul & (del "{bat.resolve()}" & exit /b %CODIGO%)\r\n'
     )
     bat.write_text(contenido, encoding="ascii")
 

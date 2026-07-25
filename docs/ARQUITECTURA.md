@@ -1,21 +1,28 @@
 # Arquitectura
 
 Aplicación de escritorio (Windows) para grabar asaltos de esgrima con tres
-cámaras simultáneas, generar un mosaico de los tres POVs y subir todo a OneDrive.
+cámaras simultáneas, generar un mosaico de los tres POVs y subir todo a Dropbox.
 Sin dependencias externas de Python: solo stdlib (Tkinter incluido). Sí requiere
 `ffmpeg`, `ffprobe`, `ffplay` y `rclone` en el PATH.
 
 ## Módulos
 
-Cinco módulos, con la GUI desacoplada del motor.
+Seis módulos, con la GUI desacoplada del motor.
 
 | Módulo | Rol | Sabe de Tkinter |
 |---|---|---|
+| `ffmpeg_utils.py` | Utilidades compartidas de FFmpeg: banderas de consola (`SIN_VENTANA`, `NUEVA_CONSOLA`) y consultas de `ffprobe` (`duracion`, `muestra_audio`, `tiene_audio`). Sin dependencias del resto. | No |
 | `grabador.py` | Motor. `Sesion` coordina el conjunto; `GrabadorCamara` envuelve un proceso FFmpeg y publica su estado en `EstadoCamara`. Numera los asaltos y persiste `config.json`. | No |
 | `dispositivos.py` | Enumeración DirectShow (vídeo y audio) vía FFmpeg, emparejado micro↔cámara y previsualización con `ffplay`. | No |
 | `mosaico.py` | Genera `mosaico.mkv` (1920x1080, tres POVs) en un proceso FFmpeg independiente con ventana propia. | No |
 | `subida.py` | `rclone copy` en un hilo, con callbacks de progreso (JSON). | No |
 | `app.py` | GUI Tkinter. Sondea `EstadoCamara` cada 500 ms para pintar los semáforos; recibe callbacks de la subida. Punto de entrada. | Sí |
+
+`ffmpeg_utils.py` es la base: lo importan los otros cuatro módulos del motor y no
+importa ninguno, así que no puede haber ciclos. Contiene **utilidades**, no
+lógica de dominio: los comandos de FFmpeg de cada módulo (`grabador.comando()`,
+`mosaico._filtro()`, `dispositivos.listar_*`) se quedan donde están, porque
+llevan invariantes que se entienden en su contexto.
 
 El motor no importa Tkinter ni sabe que existe una interfaz: se podría controlar
 desde una web o un pedal sin tocar `grabador.py`.
@@ -74,7 +81,7 @@ y [ERRORES_CONOCIDOS.md](ERRORES_CONOCIDOS.md).
 ```
 grabaciones/
   MIERCOLES_22/                jornada (DIA_NN)
-    007_Garcia_Lopez/          asalto (ID_NOMBRE1_NOMBRE2)
+    12_47_ID_027/              asalto (TIRADOR1_TIRADOR2_ID_NNN)
       cam1.mkv                 lateral izquierda
       cam2.mkv                 frontal
       cam3.mkv                 lateral derecha

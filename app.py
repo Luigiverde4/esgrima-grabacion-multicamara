@@ -1,6 +1,6 @@
 """ESGRIMA_26 - Control de grabacion multicamara.
 
-Interfaz para grabar asaltos con tres camaras y subirlos a OneDrive.
+Interfaz para grabar asaltos con tres camaras y subirlos a Dropbox.
 
 COMO SE ORGANIZA
     _construir()   monta los widgets una sola vez, al arrancar.
@@ -75,7 +75,6 @@ class App(tk.Tk):
         self._audio_disp: list = []   # ultimo listado de Dispositivo (audio)
         self._map_video: dict = {}    # etiqueta visible -> Dispositivo
         self._map_audio: dict = {}
-        self._contador_avisado = None  # ultimo desajuste de contador ya registrado
         self._cache_tamano: dict[str, float] = {}  # carpeta cerrada -> MB
         self._fichero_log = self._abrir_log()  # .txt de esta sesion, o None
 
@@ -116,7 +115,13 @@ class App(tk.Tk):
         # Enter inicia o para el asalto: mas rapido que buscar el boton con el
         # raton mientras se sigue lo que pasa en la pista.
         self.entrada.bind("<Return>", lambda _: self._alternar())
-        ttk.Label(fila, text="(opcional)", foreground=GRIS).pack(side="left")
+        # Se indica el ejemplo porque el campo admite texto libre pero lo
+        # habitual son los dos numeros de tirador: 'ej: 12 47' evita tener que
+        # recordar el formato en mitad de la competicion. Los espacios pasan a
+        # '_' al construir la carpeta (Sesion._limpiar), asi que no hay que
+        # teclear separadores.
+        ttk.Label(fila, text="(opcional - ej: 12 47)",
+                  foreground=GRIS).pack(side="left")
 
         # tk.Button en vez de ttk.Button: ttk no deja fijar el color de fondo
         # en Windows, y aqui el verde/rojo es la senal principal de estado.
@@ -216,7 +221,7 @@ class App(tk.Tk):
         # Ajustes del mosaico: que camara va grande arriba y de cual sale el
         # audio. Van aqui, con las camaras, y no en la seccion de subida, porque
         # son propiedades de la captura (que POV manda y que micro esta mejor
-        # situado), no del envio a OneDrive.
+        # situado), no del envio a Dropbox.
         #
         # Etiqueta visible ("cam2 · Frontal") -> id de camara. La comparten los
         # dos desplegables: las opciones son las mismas.
@@ -256,12 +261,12 @@ class App(tk.Tk):
         # --- Subida ---
         # Con el registro fuera, esta seccion absorbe el espacio sobrante: su
         # lista de asaltos crece y se ven mas sin scroll.
-        ms = ttk.LabelFrame(cont, text="Subida a OneDrive", padding=12)
+        ms = ttk.LabelFrame(cont, text="Subida a Dropbox", padding=12)
         ms.pack(fill="both", expand=True, pady=(0, 10))
 
         f = ttk.Frame(ms)
         f.pack(fill="x")
-        self.btn_subir = ttk.Button(f, text="Subir todo a OneDrive", command=self._subir)
+        self.btn_subir = ttk.Button(f, text="Subir todo a Dropbox", command=self._subir)
         self.btn_subir.pack(side="left")
         # Sube solo los asaltos marcados en la lista (Ctrl/Shift+clic). Arranca
         # deshabilitado: se activa cuando hay seleccion (ver _actualizar_btn_sel).
@@ -356,6 +361,16 @@ class App(tk.Tk):
 
         self._escribir(f"[{info['inicio']:%H:%M:%S}] Inicio asalto {info['numero']:03d}"
                        + (f" - {info['etiqueta']}" if info["etiqueta"] else ""))
+
+        # El numero solo salta si el calculado ya estaba grabado (config.json
+        # restaurado atrasado). Sin avisar, el hueco en la numeracion parece un
+        # fallo de la aplicacion y nadie sabria que hay un config desfasado.
+        if info["numero"] != info["numero_previsto"]:
+            self._escribir(
+                f"Aviso: el asalto {info['numero_previsto']:03d} ya estaba grabado en "
+                f"{info['jornada']}. Se numera como {info['numero']:03d} para no "
+                f"sobrescribirlo. Revisa 'ultimo_asalto' en config.json."
+            )
         self.btn.configure(text="DETENER ASALTO", bg=ROJO, activebackground=ROJO)
         self.entrada.configure(state="disabled")   # el nombre ya no puede cambiar
         self.btn_subir.configure(state="disabled")      # no subir mientras se graba
@@ -525,6 +540,20 @@ class App(tk.Tk):
         self._escribir(f"Detectados: {len(self._video_disp)} video, "
                        f"{len(self._audio_disp)} audio")
 
+        self._repintar_combos()
+
+        # Si se refresco mientras habia un asalto en curso, repinta al momento
+        # para que la fila caída quede editable sin esperar al siguiente tick.
+        if self.sesion.grabando and self.sesion.asalto_actual:
+            self._refrescar()
+
+    def _repintar_combos(self) -> None:
+        """Recarga los tres desplegables de cada camara desde el estado actual.
+
+        Usa los mapas ya en memoria, sin volver a enumerar con FFmpeg. Se llama
+        tras cada asignacion porque las opciones de una camara dependen de lo
+        que tengan las demas (ver _ocupados_por_otras).
+        """
         # Etiqueta visible del formato guardado de cada camara (mjpeg -> "MJPEG").
         fmt_a_etiqueta = {v: k for k, v in self.FORMATOS.items()}
 
@@ -535,11 +564,6 @@ class App(tk.Tk):
             # El formato solo aplica con capturadora real.
             fila.combo_fmt.configure(
                 state="readonly" if cam.configurada else "disabled")
-
-        # Si se refresco mientras habia un asalto en curso, repinta al momento
-        # para que la fila caída quede editable sin esperar al siguiente tick.
-        if self.sesion.grabando and self.sesion.asalto_actual:
-            self._refrescar()
 
     @staticmethod
     def _construir_mapa(disps: list) -> dict:
@@ -576,11 +600,30 @@ class App(tk.Tk):
                 return etiqueta
         return f"{nombre or ident}  (no disponible)"
 
+    def _ocupados_por_otras(self, cam_id: str, atributo: str) -> set:
+        """Ids que ya tienen asignados las OTRAS camaras (video o audio).
+
+        Sirve para no ofrecer en un desplegable lo que ya usa otra camara: dos
+        camaras no pueden compartir capturadora (DirectShow no deja abrir el
+        mismo dispositivo dos veces) ni tiene sentido que compartan micro. Se
+        excluye la propia camara para que su eleccion actual siga siendo
+        visible en su combo.
+        """
+        return {ident for c in self.sesion.camaras
+                if c.id != cam_id and (ident := getattr(c, atributo))}
+
     def _rellenar_combo_video(self, combo: ttk.Combobox, cam) -> None:
-        """Opciones y valor del desplegable de video de una camara."""
+        """Opciones y valor del desplegable de video de una camara.
+
+        Se omiten las capturadoras que ya usan las otras camaras (ver
+        _ocupados_por_otras). El modo prueba no se filtra: es un patron
+        sintetico, varias camaras pueden usarlo a la vez.
+        """
         etiqueta = self._etiqueta_guardada(cam.dispositivo, cam.dispositivo_nombre,
                                            self._map_video, self.MODO_PRUEBA)
-        opciones = [self.MODO_PRUEBA] + list(self._map_video)
+        ocupados = self._ocupados_por_otras(cam.id, "dispositivo")
+        opciones = [self.MODO_PRUEBA] + [e for e, d in self._map_video.items()
+                                         if d.id not in ocupados]
         if etiqueta not in opciones and etiqueta != self.MODO_PRUEBA:
             opciones.append(etiqueta)  # el guardado ya no esta conectado
         combo.configure(values=opciones)
@@ -590,6 +633,8 @@ class App(tk.Tk):
         """Opciones y valor del desplegable de audio (micro) de una camara.
 
         En modo prueba el audio no aplica: el combo queda deshabilitado.
+        Igual que en video, se omiten los micros que ya usan otras camaras;
+        '-- Sin audio --' nunca se filtra (no es un dispositivo).
         """
         if not cam.configurada:
             combo.configure(values=[self.SIN_AUDIO], state="disabled")
@@ -597,7 +642,9 @@ class App(tk.Tk):
             return
         etiqueta = self._etiqueta_guardada(cam.audio, cam.audio,
                                            self._map_audio, self.SIN_AUDIO)
-        opciones = [self.SIN_AUDIO] + list(self._map_audio)
+        ocupados = self._ocupados_por_otras(cam.id, "audio")
+        opciones = [self.SIN_AUDIO] + [e for e, d in self._map_audio.items()
+                                       if d.id not in ocupados]
         if etiqueta not in opciones and etiqueta != self.SIN_AUDIO:
             opciones.append(etiqueta)
         combo.configure(values=opciones, state="readonly")
@@ -635,8 +682,9 @@ class App(tk.Tk):
             self._escribir(msg)
         else:
             self._escribir(f"{cam_id} -> modo prueba")
-        # Refleja el micro autoemparejado (o su ausencia) en los combos.
-        self._refrescar_dispositivos()
+        # Refleja el micro autoemparejado (o su ausencia) y quita de las otras
+        # camaras lo que esta acaba de tomar. Sin reenumerar: ver _elegir_audio.
+        self._repintar_combos()
 
     def _elegir_audio(self, cam_id: str, combo: ttk.Combobox) -> None:
         """Guarda el micro elegido a mano para una camara."""
@@ -646,6 +694,11 @@ class App(tk.Tk):
         disp = self._map_audio.get(etiqueta) if etiqueta != self.SIN_AUDIO else None
         self.sesion.guardar_audio(cam_id, disp.id if disp else None)
         self._escribir(f"{cam_id} · micro -> {disp.nombre if disp else 'sin audio'}")
+        # Repinta los combos para que el micro recien tomado desaparezca de las
+        # otras camaras. Se repintan sin reenumerar (no se llama a
+        # _refrescar_dispositivos): enumerar lanza FFmpeg y bloquea un instante
+        # la interfaz, y aqui los dispositivos conectados no han cambiado.
+        self._repintar_combos()
 
     def _elegir_formato(self, cam_id: str, combo: ttk.Combobox) -> None:
         """Guarda el formato de entrada elegido (MJPEG/YUYV/Auto)."""
@@ -733,9 +786,25 @@ class App(tk.Tk):
 
     # ---------------------------------------------------------------- subida
 
+    @staticmethod
+    def _clave_orden(carpeta: Path) -> tuple:
+        """Ordena por jornada y despues por numero de asalto.
+
+        No vale el orden alfabetico del nombre completo: con el ID al final
+        ('12_47_ID_027'), ordenar por nombre agrupa por numero de tirador y la
+        lista deja de ser cronologica. En directo, el asalto que se busca es
+        casi siempre el ultimo, asi que el orden por ID es el util.
+
+        Las carpetas sin ID reconocible (creadas a mano) van al final, con -1,
+        en vez de romper la ordenacion.
+        """
+        m = Sesion._RE_ASALTO.search(carpeta.name)
+        return (carpeta.parent.name, int(m.group(1)) if m else -1, carpeta.name)
+
     def _asaltos_en_disco(self) -> list[Path]:
-        """Asaltos grabados, ordenados. Cuelgan de la jornada: MIERCOLES_22/007_..."""
-        return sorted(d for d in self.sesion.raiz.glob("*/*") if d.is_dir())
+        """Asaltos grabados, ordenados. Cuelgan de la jornada: MIERCOLES_22/12_47_ID_027"""
+        return sorted((d for d in self.sesion.raiz.glob("*/*") if d.is_dir()),
+                      key=self._clave_orden)
 
     # Marca de "ya subido": un fichero vacio '.subido' dentro de la carpeta del
     # asalto. Se usa un fichero aparte (no un campo en metadata.json) para no
@@ -868,7 +937,7 @@ class App(tk.Tk):
                 if i < len(self._asaltos_lista)]
 
     def _subir(self) -> None:
-        """Sube TODAS las grabaciones a OneDrive. Pensado para el final del dia."""
+        """Sube TODAS las grabaciones a Dropbox. Pensado para el final del dia."""
         self._lanzar_subida(self._asaltos_en_disco(), selectivo=False)
 
     def _subir_seleccionados(self) -> None:
@@ -969,7 +1038,7 @@ class App(tk.Tk):
             self._pintar_lista()
             self._escribir(mensaje)
             if ok:
-                messagebox.showinfo("Subida completada", "Los asaltos estan en OneDrive.")
+                messagebox.showinfo("Subida completada", "Los asaltos estan en Dropbox.")
             else:
                 messagebox.showerror("Error en la subida", mensaje)
         self.after(0, aplicar)
@@ -1075,7 +1144,6 @@ class App(tk.Tk):
             self.lbl_asalto.configure(
                 text=f"Listo - siguiente: asalto {n:03d}  -  {self.sesion.carpeta_dia()}"
             )
-            self._avisar_contador_ignorado()
 
         # La lista de asaltos solo se toca cuando no hay subida en marcha: si la
         # hay, la mantiene _avance_subida() para marcar el que se transfiere.
@@ -1084,30 +1152,6 @@ class App(tk.Tk):
 
         # Se reencola el proximo refresco: aqui es donde el ciclo se perpetua.
         self.after(500, self._refrescar)
-
-    def _avisar_contador_ignorado(self) -> None:
-        """Avisa si el contador de config.json va por detras de lo grabado.
-
-        Pasa al restaurar un config antiguo o al editarlo a mano. La numeracion
-        no corre peligro (siguiente_numero() toma el mayor de los dos), pero en
-        silencio es indistinguible de un fallo al guardar: sin este aviso, bajar
-        el contador a mano parece no tener efecto y no se sabe por que.
-
-        Se registra una sola vez por desajuste, no en cada refresco de 500 ms.
-        """
-        desajuste = self.sesion.contador_ignorado
-        if desajuste == self._contador_avisado:
-            return
-        self._contador_avisado = desajuste
-        if desajuste is None:
-            return
-        guardado, en_disco = desajuste
-        self._escribir(
-            f"Aviso: 'ultimo_asalto' en config.json es {guardado}, pero hay "
-            f"asaltos grabados hasta el {en_disco:03d}. Se numera desde el disco "
-            f"({en_disco + 1:03d}) para no sobrescribir. Para renumerar mas bajo, "
-            f"archiva antes las jornadas anteriores."
-        )
 
     def _al_cerrar(self) -> None:
         """Impide cerrar por accidente con un asalto o una subida en marcha.

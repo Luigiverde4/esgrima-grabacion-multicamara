@@ -28,7 +28,7 @@ Solo el cierre limpio escribe la duración en el contenedor. Por eso el proceso 
 lanza con `stdin=PIPE` y **sin** `-nostdin`. Cascada de tres intentos:
 `q` (8 s) → `terminate()` (5 s) → `kill()`. `terminate()` produce fichero
 reproducible pero sin duración; queda como plan B por timeout.
-→ `grabador.py`, `detener()`.
+→ `grabador.py`, `pedir_parada()` / `esperar_cierre()`.
 
 ### La parada va en dos pasadas: `q` a los tres, luego esperar
 `detener_asalto()` llama primero a `pedir_parada()` en las tres cámaras y solo
@@ -44,7 +44,7 @@ FFmpeg sale con código distinto de cero de forma legítima cuando lo paramos
 nosotros. Sin esta bandera, cada parada normal se marcaría como fallo. Se activa
 **antes** de tocar el proceso, porque el hilo lector puede despertar en cuanto
 FFmpeg muera.
-→ `grabador.py`, `detener()` / `_leer_progreso()`.
+→ `grabador.py`, `pedir_parada()` / `_leer_progreso()`.
 
 ### Filtrado de ruido de FFmpeg (`_RUIDO`)
 Avisos benignos (Fontconfig, `deprecated`, `non-monotonic`...) marcarían cámaras
@@ -64,9 +64,27 @@ Daría una cámara por buena cuando no lo está — peor que una falsa alarma.
 ### Detección de imagen congelada por contador de frames
 No basta con mirar si el proceso vive: cuando se afloja el HDMI, FFmpeg sigue
 corriendo y el fichero sigue creciendo, pero la imagen se queda quieta. Lo que lo
-delata es que el contador de frames deja de avanzar (`EstadoCamara.bloqueada`,
-umbral 5 s). Se exige `frames > 0` para no dar la alarma durante el arranque.
+delata es que el contador de frames deja de avanzar (`EstadoCamara.bloqueada`).
+Se exige `frames > 0` para no dar la alarma durante el arranque.
 → `grabador.py`, `EstadoCamara.bloqueada`.
+
+### El umbral de congelada son 2 s (`UMBRAL_CONGELADA_S`)
+FFmpeg informa cada 0,5 s (`-stats_period`), así que 2 s son **tres informes
+perdidos**. El valor sale de medir el hueco real entre informes con tres cámaras
+1080p: **0,52 s** en reposo y **0,64 s** con las 16 CPU saturadas — ninguna falsa
+alarma en ninguno de los dos casos.
+
+Estuvo en 5 s (diez informes: demasiado lento en directo) y en 1 s. **No bajarlo
+a 1 s sin volver a medir con capturadoras reales**: las medidas de arriba usan
+`testsrc2`, que no toca USB ni DirectShow. En `yuyv422` a 1080p el bus va justo
+— es el escenario que produce el aviso `real-time buffer too full` de `_RUIDO`,
+que ya marcó las tres cámaras como caídas en un asalto perfectamente válido.
+
+El equilibrio es asimétrico y por eso se elige el lado conservador: detectar 1 s
+más tarde cuesta 1 s de vídeo congelado, mientras que una falsa alarma empuja al
+operador a relanzar, y **relanzar sin motivo sí destruye valor** (corta el trozo
+e inserta un hueco negro en una grabación que estaba sana). Prioridad 3.
+→ `grabador.py`, `EstadoCamara.UMBRAL_CONGELADA_S`.
 
 ### Arranque secuencial de las tres cámaras
 Se lanzan de una en una (~1 s de desfase total). Consecuencia: los tres POV **no
@@ -84,6 +102,30 @@ concatenan todos en un único `cam1.mkv` con el demuxer `concat` y `-c copy`
 La unión escribe a un fichero aparte y solo sustituye al original si FFmpeg sale
 con éxito: si falla, **se conservan los trozos sueltos** — nunca se destruye
 material grabado por un fallo al unir.
+
+### Al unir trozos se mide con `duracion_real()`, no con `duracion()`
+`duracion()` lee la cabecera del contenedor: es instantáneo, pero devuelve `0.0`
+cuando el fichero se cortó sin cerrar (`ffprobe` informa `N/A`). Ese trozo **sí
+tiene vídeo**; solo le falta el dato en la cabecera.
+
+Para el uso original ese `0.0` era correcto ("no declarar hueco, que es lo
+prudente"). Pero `_unir_trozos()` lo usa en otra cuenta —
+`falta = referencia − grabado`— donde `0.0` no significa "no declares nada" sino
+**"este trozo no dura nada"**, e infla el negro justo en los segundos que el
+trozo sí duraba. Un valor neutro correcto en un sitio, usado donde no lo era.
+
+Medido: cámara caída con el proceso muerto de golpe, trozos de 0 s (mal cerrado)
++ 6,7 s. `grabado` salía 6,7 en vez de ~10, `falta` 8,77 en vez de ~4,8, y el
+fichero final duraba **18,93 s frente a 15,47** de las sanas. Con
+`duracion_real()`: 15,43 / 15,47 / 15,47.
+
+**Por qué no se había visto:** depende de cómo muera FFmpeg. Con un USB suelto
+—el caso habitual— FFmpeg detecta el error y cierra el MKV ordenadamente, la
+duración queda escrita y el cálculo sale bien. Solo falla cuando el proceso muere
+sin cerrar: corte de corriente del hub, cuelgue, o la rama `kill()` de
+`esperar_cierre()`. Además el síntoma son unos segundos de negro de más al final
+de una sola cámara: invisible sin comparar las tres duraciones con `ffprobe`.
+→ `ffmpeg_utils.py`, `duracion_real()`; `grabador.py`, `_duracion`.
 
 ### El hueco de la caída se rellena con negro real
 Entre trozo y trozo se genera un segmento temporal negro con los mismos
@@ -161,6 +203,30 @@ ellos, no al revés, para que vídeo y audio nunca se desincronicen.
 
 ## Mosaico
 
+### `NUEVA_CONSOLA` es solo para el mosaico; `ffprobe` va siempre `SIN_VENTANA`
+La ventana de consola del mosaico **es deliberada y se conserva**: es donde
+FFmpeg pinta su progreso y donde el operador ve si se ha atascado.
+
+Lo que no debe llevarla es `ffprobe`. Sus consultas son instantáneas y no pintan
+nada, así que abrirles una consola solo producía **4 ventanas negras parpadeando**
+antes de la ventana útil (una por `tiene_audio` y tres por `duracion`). Venía de
+copiar la constante del módulo en funciones que se trajeron del grabador.
+
+Ahora ambas constantes viven en `ffmpeg_utils.py` y las consultas usan
+`SIN_VENTANA` internamente, así que el error no se puede repetir por descuido.
+→ `ffmpeg_utils.py`, `SIN_VENTANA` / `NUEVA_CONSOLA`; `mosaico.py`, `generar()`.
+
+### `ffmpeg_utils.py` centraliza utilidades, no lógica de dominio
+Las banderas de consola estaban copiadas literalmente en cuatro módulos y
+`_duracion()` en dos, ya con diferencias entre copias. Se unifican en
+`ffmpeg_utils.py`, que no importa a nadie del proyecto (imposible crear ciclos).
+
+**Lo que NO se movió, a propósito:** `grabador.comando()`, `mosaico._filtro()` y
+`dispositivos.listar_*`. Construyen las líneas de FFmpeg de cada módulo y llevan
+invariantes documentadas aquí; sacarlas de su contexto las haría más difíciles de
+entender. La modularidad útil era extraer lo compartido, no trocear el dominio.
+→ `ffmpeg_utils.py`.
+
 ### El mosaico es un proceso independiente, no un hilo daemon
 Recodificar tres 1080p tarda más que el asalto. Antes corría en un hilo daemon;
 al cerrar la app, Python mataba el hilo y FFmpeg moría sin cerrar el MKV →
@@ -187,6 +253,31 @@ un `.bat` temporal (no `cmd /c "una línea"`) porque el `filter_complex` contien
 `&`, `()`, `;`, `[]` — metacaracteres de `cmd.exe` — y meterlo inline exige un
 escapado frágil. Rutas absolutas y filtro entrecomillado.
 → `mosaico.py`, `generar()`. Ver [ERRORES_CONOCIDOS.md](ERRORES_CONOCIDOS.md).
+
+### El `.bat` se cierra con `endlocal & (goto) 2>nul & (del … & exit /b %CODIGO%)`
+Esa línea final parece un jeroglífico pero cada parte hace falta, y está medida
+con las cuatro combinaciones (éxito/fallo × borrado/no borrado).
+
+Un `del "<el propio .bat>"` a secas **hace que el proceso salga siempre con
+código 1**, incluso cuando el mosaico se ha generado perfectamente: `cmd` lee el
+fichero por líneas conforme avanza, y al borrarlo intenta leer la siguiente línea
+de un fichero que ya no existe (`The batch file cannot be found`).
+
+Era un fallo latente: `app.py` solo mira si `generar()` devuelve `None`, así que
+no se notaba. Pero cualquiera que añadiese un `if proc.wait() == 0` para avisar de
+mosaicos fallidos habría visto fallo en el 100 % de los mosaicos correctos —
+justo lo contrario de la prioridad 2.
+
+- `(goto) 2>nul` cierra el contexto del batch **antes** de borrarlo, para que
+  `cmd` no vuelva a leer el fichero.
+- `%CODIGO%` se guarda con `set` tras FFmpeg y tras el `move`, porque
+  `if errorlevel` no lo conserva: sin guardarlo, el código que sale es el del
+  último comando ejecutado (el propio `del`), no el de FFmpeg.
+- `exit /b %CODIGO%` lo devuelve.
+
+Verificado: éxito → `0` con `mosaico.mkv` renombrado; entrada corrupta → código
+distinto de 0 **sin** renombrar; el `.bat` se borra en ambos casos.
+→ `mosaico.py`, `generar()`.
 
 ### La cámara de arriba del mosaico se elige en la interfaz
 Qué POV va grande arriba lo decide el operador en el desplegable "Mosaico ·
@@ -220,7 +311,7 @@ una cámara sin micro asignado.
 ## Subida
 
 ### `rclone copy`, nunca `sync`
-`sync` borraría en OneDrive todo lo que no exista en local — destruiría
+`sync` borraría en Dropbox todo lo que no exista en local — destruiría
 grabaciones ya subidas.
 → `subida.py`, `subir()`.
 
@@ -244,18 +335,55 @@ muere a mitad, el número queda reservado y no se reutiliza (no se sobrescribe u
 grabación parcial).
 → `grabador.py`, `iniciar_asalto()` / `_guardar_contador()`.
 
-### El contador solo puede subir, y el desajuste se avisa
-`siguiente_numero()` toma el **mayor** entre `ultimo_asalto` y lo grabado en
-disco. Consecuencia: bajar el contador a mano en `config.json` **no renumera
-nada** mientras queden grabaciones más altas; para renumerar hay que archivar
-antes esas jornadas. Cuando el disco manda se anota en `Sesion.contador_ignorado`
-y la interfaz lo registra en el log (una vez por desajuste, no en cada refresco):
-en silencio, un contador ignorado es indistinguible de un fallo al guardar.
-→ `grabador.py`, `siguiente_numero()`; `app.py`, `_avisar_contador_ignorado()`.
+### `config.json` es el punto único de control de la numeración
+`siguiente_numero()` devuelve `ultimo_asalto + 1` y **no mira el disco**. El
+contador se corrige o se reinicia editando un número en un fichero, y nada más;
+renombrar o mover carpetas no lo altera en ningún sentido.
 
-### `_maximo_en_disco()` exige metadata.json
-Es la red de seguridad por si `config.json` se pierde. Exige tres condiciones y
-las tres importan: jornada válida (`_RE_JORNADA`), nombre `NNN` (`_RE_ASALTO`) y
-**presencia de `metadata.json`**. Sin la última, una carpeta creada a mano como
-`500_revisar` dispararía el contador a 501.
-→ `grabador.py`, `_maximo_en_disco()`. Ver [FLUJO_DE_TRABAJO.md](FLUJO_DE_TRABAJO.md).
+Antes se tomaba el **mayor** entre el contador y un escaneo del disco
+(`_maximo_en_disco()`, eliminado). Se quitó porque hacía el contador
+unidireccional: bajarlo a mano no renumeraba nada mientras quedaran grabaciones
+más altas, lo que obligaba a archivar jornadas para reiniciar y era difícil de
+explicar al operador.
+
+Contrapartida asumida: si `config.json` se pierde o se restaura una copia
+antigua, el contador retrocede. Contra eso protege la comprobación de colisión
+de abajo, que es lo que garantiza la prioridad 1 (no perder una grabación).
+→ `grabador.py`, `siguiente_numero()`.
+
+### Nunca se graba dentro de una carpeta que ya tiene material
+`iniciar_asalto()` comprueba si el número calculado ya existe en la jornada y,
+si existe, avanza al primero libre. Sin esta comprobación un contador atrasado
+sería destructivo en silencio: `mkdir(exist_ok=True)` no falla, se grabaría
+dentro de la carpeta existente y los `.mkv` anteriores se sobrescribirían.
+
+La colisión se busca por el **ID del final del nombre**, no por el nombre
+completo: `12_47_ID_027` y `3_9_ID_027` son el mismo asalto con distintos
+tiradores y colisionan igual.
+
+Solo cuenta como ocupada si hay **`metadata.json`**, que únicamente escribe esta
+aplicación al terminar de grabar. Una carpeta vacía (arranque fallido, o creada
+a mano) no bloquea el número ni deja huecos en la numeración.
+
+El salto se registra en el log del operador: una numeración que da un brinco sin
+explicación parece un fallo de la aplicación, cuando lo que hay es un
+`config.json` desfasado.
+→ `grabador.py`, `iniciar_asalto()` / `_carpeta_ocupada()`; `app.py`, `_iniciar()`.
+
+### El ID del asalto va al FINAL del nombre, tras `_ID_`
+`12_47_ID_027`, no `027_12_47`. Los tiradores se identifican por número, y con
+el ID delante el operador no podía distinguir de un vistazo cuál de los tres
+números era el asalto.
+
+El marcador literal `_ID_` no es decorativo: sin él, un nombre formado solo por
+campos numéricos separados por `_` es **ambiguo de analizar** (en `105_212_027`
+no hay forma robusta de saber cuál es el asalto, y los números de tirador pueden
+tener tres cifras). Con el marcador, `_RE_ASALTO` es exacto.
+→ `grabador.py`, `_RE_ASALTO` / `iniciar_asalto()`.
+
+### La lista de asaltos se ordena por ID, no por nombre
+Con el ID al final, el orden alfabético agrupa por número de tirador y deja de
+ser cronológico. En directo el asalto que se busca es casi siempre el último, así
+que se ordena por el ID extraído del nombre. Las carpetas sin ID reconocible van
+al final en vez de romper la ordenación.
+→ `app.py`, `_clave_orden()` / `_asaltos_en_disco()`.
