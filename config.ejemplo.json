@@ -1,0 +1,41 @@
+{
+  "modo_prueba": false,
+  "carpeta_grabaciones": "grabaciones",
+  "rclone_destino": "dropbox:NOMBRE_COMPETICION",
+  "competicion": "NOMBRE_COMPETICION",
+  "ultimo_asalto": 0,
+  "video": {
+    "resolucion": "1920x1080",
+    "fps": 30,
+    "preset": "medium",
+    "crf": 22
+  },
+  "camaras": [
+    {
+      "id": "cam1",
+      "nombre": "Lateral izquierda",
+      "dispositivo": null,
+      "dispositivo_nombre": null,
+      "audio": null,
+      "formato": "mjpeg"
+    },
+    {
+      "id": "cam2",
+      "nombre": "Frontal",
+      "dispositivo": null,
+      "dispositivo_nombre": null,
+      "audio": null,
+      "formato": "mjpeg"
+    },
+    {
+      "id": "cam3",
+      "nombre": "Lateral derecha",
+      "dispositivo": null,
+      "dispositivo_nombre": null,
+      "audio": null,
+      "formato": "mjpeg"
+    }
+  ],
+  "audio_mosaico": "cam1",
+  "frontal_mosaico": "cam1"
+}

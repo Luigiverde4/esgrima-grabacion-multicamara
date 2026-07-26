@@ -285,6 +285,16 @@ class GrabadorCamara:
                         muestra_audio: int | None = None) -> Path | None:
         """Crea un trozo negro temporal para representar un hueco de relanzamiento.
 
+        'hueco' va en SEGUNDOS y es lo que durara el negro. 'indice' solo entra
+        en el nombre del fichero temporal ('_cam1_gap_1.mkv'), para que dos
+        huecos de la misma camara no se pisen. 'muestra_audio' es la frecuencia
+        en Hz que debe tener el silencio: si es None se usa 44100, pero conviene
+        pasar la del trozo real (ver ffmpeg_utils.muestra_audio) para que el
+        demuxer concat no tenga que mezclar frecuencias distintas.
+
+        Devuelve la ruta del temporal, o None si no se pudo generar; quien llama
+        debe tratar ese None (ver el plan B de _unir_trozos).
+
         Se usa solo al unir: el trozo resultante lleva video negro real (y audio
         en silencio si la camara tenia micro), de modo que el fichero final no
         depende de saltos de timestamps para mostrar el tramo caido.
@@ -337,10 +347,16 @@ class GrabadorCamara:
     def iniciar(self, carpeta: Path, relanzamiento: bool = False) -> None:
         """Lanza FFmpeg y el hilo que vigila su salida. No bloquea.
 
+        'carpeta' es la del asalto, ya creada: aqui dentro se escribe el .mkv de
+        esta camara.
+
         'relanzamiento' distingue el arranque normal del asalto de volver a
-        lanzar una camara caida. Al relanzar se escribe en un fichero libre
-        (cam1_b.mkv, cam1_c.mkv...) para no pisar lo ya grabado; al detener el
-        asalto se concatenan en un unico cam1.mkv (ver Sesion._unir_trozos).
+        lanzar una camara caida, y cambia bastante lo que pasa: en el arranque
+        normal se reinician trozos, huecos y contador de frames; al relanzar se
+        conservan, se anota el hueco de la caida y se escribe en un fichero
+        libre (cam1_b.mkv, cam1_c.mkv...) para no pisar lo ya grabado. Al
+        detener el asalto se concatenan en un unico cam1.mkv (ver
+        Sesion._unir_trozos).
         """
         self.carpeta = carpeta
         if not relanzamiento:
@@ -530,6 +546,13 @@ class Sesion:
     """
 
     def __init__(self, ruta_cfg: Path):
+        """'ruta_cfg' es el config.json, que se lee AQUI y se reescribe despues.
+
+        De el salen las camaras y la carpeta de grabaciones (que se crea si no
+        existe). Los cambios posteriores (dispositivos, contador, ajustes del
+        mosaico) se persisten en ese mismo fichero releyendolo antes de escribir,
+        para no pisar lo que se haya tocado por fuera: ver _actualizar_config().
+        """
         self.ruta_cfg = ruta_cfg
         self.cfg = json.loads(ruta_cfg.read_text(encoding="utf-8"))
         self.camaras = [Camara(**c) for c in self.cfg["camaras"]]
@@ -690,6 +713,11 @@ class Sesion:
         micro; si se quita el video, tambien se quita el audio (no tiene sentido
         grabar solo el micro). La eleccion manual de micro va en guardar_audio().
 
+        'audios' es la lista de micros ya enumerada, que se pasa para no volver
+        a preguntar a FFmpeg (bloquea un instante la interfaz). Si es None se
+        enumera aqui, comodo desde un script pero peor desde la GUI, que ya la
+        tiene en memoria.
+
         Si el micro que sale del emparejado ya lo tiene otra camara, se deja sin
         audio en vez de duplicarlo: con capturadoras identicas el emparejado va
         por nombre y puede devolver el mismo micro para dos camaras. Mejor una
@@ -757,6 +785,12 @@ class Sesion:
     def iniciar_asalto(self, etiqueta: str = "") -> dict:
         """Crea la carpeta del asalto y arranca las tres camaras.
 
+        'etiqueta' es texto libre del operador (normalmente los dos numeros de
+        tirador: "12 47"). Se limpia con _limpiar() y encabeza el nombre de la
+        carpeta; vacia deja solo el ID. No se valida a proposito: en directo un
+        campo que rechaza lo que se teclea es un obstaculo.
+
+        Devuelve el dict del asalto en curso (numero, carpeta, jornada, inicio).
         Vuelve enseguida: las camaras siguen grabando en segundo plano y su
         estado se consulta a traves de self.grabadores[i].estado.
         """

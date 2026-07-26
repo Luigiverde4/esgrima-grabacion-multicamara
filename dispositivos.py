@@ -57,6 +57,10 @@ def _enumerar() -> str:
 def _extraer(tipo: str, salida: str) -> list[Dispositivo]:
     """Dispositivos de un tipo ('video'/'audio') con su id de hardware.
 
+    'salida' es el texto crudo que devuelve _enumerar(). Se pasa en vez de
+    enumerar aqui dentro para que listar_video_y_audio() pueda sacar los dos
+    tipos de una sola llamada a FFmpeg.
+
     Se empareja cada linea de dispositivo con su 'Alternative name' inmediato.
     Si no hubiera alt name, el id cae al propio nombre. Se deduplica por id (no
     por nombre): asi dos capturadoras con el mismo nombre no se colapsan en una.
@@ -112,6 +116,10 @@ def _raiz(nombre: str) -> str:
 def emparejar_audio(video: Dispositivo, audios: list[Dispositivo]) -> Dispositivo | None:
     """Micro que corresponde a una capturadora de video, o None si no hay.
 
+    'audios' son los micros entre los que buscar, normalmente los de
+    listar_audio(). Quien llama decide que lista pasa: la GUI excluye los ya
+    asignados a otras camaras para no emparejar dos veces el mismo.
+
     Se empareja por NOMBRE, no por id de hardware: los dispositivos de audio no
     exponen el path USB de su capturadora (usan '@device_cm_...\\wave_{GUID}'),
     asi que el sistema no da la relacion fisica video<->audio. El nombre es la
@@ -140,6 +148,12 @@ def emparejar_audio(video: Dispositivo, audios: list[Dispositivo]) -> Dispositiv
 
 def previsualizar(dispositivo: str, resolucion: str, fps: int) -> subprocess.Popen | None:
     """Abre una ventana de ffplay con la imagen en vivo del dispositivo.
+
+    'dispositivo' es el id de hardware (Dispositivo.id), no el nombre visible.
+    'resolucion' va como cadena 'ANCHOxALTO' ('1920x1080') y junto con 'fps' es
+    el modo que se le pide a la capturadora, no el tamano de la ventana: si la
+    capturadora no admite ese modo, ffplay falla igual que fallaria la
+    grabacion. Ambos salen de config.json para previsualizar lo que se grabara.
 
     Devuelve el proceso para poder cerrarlo despues, o None si ffplay no esta.
     No sirve para el dispositivo que se esta grabando: DirectShow no deja que

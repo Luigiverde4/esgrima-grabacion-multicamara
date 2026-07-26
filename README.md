@@ -3,6 +3,23 @@
 Soporte de grabación para una competición de esgrima: tres cámaras sobre la pista,
 un fichero por POV y asalto, y subida a Dropbox al terminar el evento.
 
+## Puesta en marcha
+
+`config.json` **no se versiona**: lleva los identificadores DirectShow de las
+capturadoras, que solo son válidos en el PC donde se enumeraron, y el contador
+`ultimo_asalto`. En una máquina nueva, antes de arrancar:
+
+```
+copy config.ejemplo.json config.json
+```
+
+Después, desde la propia interfaz, asignar cada capturadora y su micro en los
+desplegables de cada cámara — se guardan solos en `config.json`. Mientras una
+cámara no tenga capturadora asignada, la app graba `testsrc2` en su lugar, así
+que arranca sin configurar nada.
+
+Requiere `ffmpeg`, `ffprobe`, `ffplay` y `rclone` en el `PATH`.
+
 ## Uso
 
 ```

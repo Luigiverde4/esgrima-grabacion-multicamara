@@ -5,6 +5,11 @@ __pycache__/
 .venv/
 venv/
 
+# Configuracion de ESTA maquina: IDs de dispositivo DirectShow (solo validos en
+# el PC donde se enumeraron), destino de rclone y el contador 'ultimo_asalto',
+# que cambia en cada asalto. Se versiona 'config.ejemplo.json' como plantilla.
+config.json
+
 # Grabaciones: material de trabajo, no va al control de versiones.
 # Las graba la app y se suben a OneDrive con rclone.
 grabaciones/
@@ -18,6 +23,9 @@ mosaico.parcial.mkv
 
 # Binarios reservados de MediaMTX (aun sin usar; no versionar el ejecutable).
 mediamtx.exe
+
+# Ajustes locales de Claude Code (permisos de esta maquina).
+.claude/settings.local.json
 
 # Sistema operativo
 Thumbs.db

@@ -40,29 +40,42 @@ propia, `cmd /c`, buffer de la ventana) y no en el filtro.
 `mosaico.parcial.mkv` y `_mosaico.bat`, y relanzarlo. Las grabaciones `camN.mkv`
 nunca se ven afectadas: el mosaico es un proceso aparte que solo lee.
 
-## 2. Pérdida de frames por USB con `yuyv422`
+## 2. Nunca se llega a 30 fps efectivos (MJPEG descartado como solución)
 
-**Estado:** diagnosticado, con solución conocida, sin aplicar.
+**Estado:** abierto. La causa que se creía confirmada **no lo está**, y la
+solución que se daba por buena **está descartada por medición**.
 
-Las tres cámaras están en `yuyv422` a 1080p30 en `config.json`. Sin comprimir
-satura el bus USB y se pierden frames de verdad:
+Ninguna cámara alcanza los 30 fps nominales. Estado actual en `config.json`:
+`cam1` y `cam3` en `yuyv422`, `cam2` en `mjpeg`.
 
-| asalto | cámara | fps efectivo |
-|---|---|---|
-| 044 | cam1 / cam2 / cam3 | 28,7 / 26,5 / 25,0 |
-| 056 | cam1 (relanzada) | 12,6 |
-| 056 | cam2 / cam3 | 28,9 / 27,4 |
+| asalto | formato | duración | frames | fps efectivo |
+|---|---|---|---|---|
+| 044 | yuyv422 ×3 | — | — | 28,7 / 26,5 / 25,0 |
+| 056 | yuyv422 ×3 | — | — | 12,6 (relanzada) / 28,9 / 27,4 |
+| 024 | yuv / mjpeg / yuv | 34,5 s | 761 / 871 / 882 | 22,1 / 25,2 / 25,6 |
+| **016** | **mjpeg ×3** | **31,9 s** | **760 / 794 / 777** | **23,8 / 24,9 / 24,4** |
 
-Es la causa de fondo de los avisos `real-time buffer ... too full` (ya filtrados
-como ruido) y probablemente también del `I/O error` al arrancar alguna cámara.
+**Qué se probó y qué se descartó:**
 
-**Solución:** pasar las cámaras a **MJPEG** en su desplegable de formato, o
-conectar las capturadoras a puertos USB 3.0 con ancho de banda suficiente. Es un
-cambio desde la interfaz, sin tocar código. Ver
-[docs/ERRORES_CONOCIDOS.md](docs/ERRORES_CONOCIDOS.md).
+- *Saturación del bus USB por vídeo sin comprimir* → se propuso pasar a MJPEG.
+  **Descartado como solución:** en `016`, con las **tres** cámaras en MJPEG, el
+  fps efectivo sigue en 23,8-24,9. Comprimir no acercó nada a 30; de hecho el
+  mejor registro de toda la tabla sigue siendo `yuyv422` (28,9 en `056`).
 
-**Pendiente de verificar:** grabar un asalto en MJPEG y comparar `frames` en
-`metadata.json` — deberían acercarse a `duración × 30`.
+**Por dónde seguir:** el techo de ~25 fps con las tres en MJPEG apunta a que el
+cuello de botella no es el ancho de banda del bus. Hipótesis sin comprobar:
+
+- Las cámaras de `config.json` son **Iriun Webcam** (dispositivos virtuales, el
+  móvil como webcam), no las capturadoras USB. Si las mediciones se tomaron con
+  Iriun, el límite puede venir del transporte de Iriun y no decir nada del
+  hardware real. **Primer paso: repetir la medición con las capturadoras
+  físicas conectadas**, que es el escenario de competición.
+- Comprobar qué framerates anuncia de verdad cada dispositivo:
+  `ffmpeg -f dshow -list_options true -i video="<nombre>"`.
+
+Sigue siendo la explicación más plausible de los avisos `real-time buffer ...
+too full` (ya filtrados como ruido) y quizá del `I/O error` al arrancar alguna
+cámara. Ver [docs/ERRORES_CONOCIDOS.md](docs/ERRORES_CONOCIDOS.md).
 
 ## 3. Caída real de una capturadora, sin probar
 
@@ -70,6 +83,12 @@ Todo lo de relanzar y unir trozos está verificado con `testsrc2` y parando FFmp
 por software. **Falta probar el caso real**: desenchufar una capturadora a mitad
 de asalto y reconectarla. Ahí dshow puede comportarse distinto a como lo hace un
 proceso que se para solo.
+
+**Caso observado sin explicar:** en `026_TEST`, `cam3` terminó con `frames: 0` en
+`metadata.json` pese a los 10,1 s de duración del asalto. Si no fue algo
+provocado a propósito en esa prueba, es justo el fallo que la prioridad nº 1 (no
+perder una grabación) tiene que hacer visible al instante: comprobar si la
+interfaz lo señaló mientras grababa o si pasó desapercibido.
 
 ## 4. Los laterales del mosaico desaprovechan un tercio de su celda
 
@@ -101,10 +120,17 @@ De la revisión inicial, por orden de importancia:
 
 - **Colisión de carpeta de jornada.** `carpeta_dia()` usa día de la semana + día
   del mes (`SABADO_25`), que se repite cada 4 semanas: dos competiciones caerían
-  en la misma carpeta. Además `_asaltos_en_disco()` ordena alfabéticamente, así
-  que `MIERCOLES_9` sale después de `MIERCOLES_22`. Arreglo propuesto: incluir
-  año y mes (`2026-07-25_SABADO`), aceptando ambos formatos en `_RE_JORNADA`
-  durante la transición.
+  en la misma carpeta. Arreglo propuesto: incluir año y mes
+  (`2026-07-25_SABADO`), aceptando ambos formatos en `_RE_JORNADA` durante la
+  transición.
+- **Las jornadas se ordenan por nombre del día, no por fecha.** `_clave_orden()`
+  ordena por `carpeta.parent.name` como texto. Dentro de una jornada el orden es
+  correcto (por el ID del asalto), pero **entre** jornadas sale alfabético por
+  nombre del día: en una competición de fin de semana, `DOMINGO_26` aparece
+  antes que `SABADO_25`. El mismo arreglo del punto anterior lo resuelve de
+  paso, porque un prefijo `AAAA-MM-DD` ya ordena cronológicamente como texto.
+  (Nota: el día va con `{day:02d}`, así que `MIERCOLES_09` frente a
+  `MIERCOLES_22` **no** es un problema — se descartó al verificarlo.)
 - **Nombres reservados de Windows.** `_limpiar()` deja pasar `CON`, `PRN`, `AUX`.
   Si el operador los teclea como tiradores, `mkdir` falla y el asalto no arranca
   (se avisa, pero cuesta un asalto). Caso remoto.

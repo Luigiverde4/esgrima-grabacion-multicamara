@@ -3,7 +3,7 @@
 Guía para Claude Code (claude.ai/code) al trabajar en este repositorio.
 
 Aplicación de escritorio (Windows) para grabar asaltos de esgrima con tres
-cámaras, componer un mosaico de los tres POVs y subir todo a OneDrive.
+cámaras, componer un mosaico de los tres POVs y subir todo a Dropbox.
 
 ## Documentación
 

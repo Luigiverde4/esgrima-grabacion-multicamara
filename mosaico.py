@@ -49,6 +49,11 @@ _ALTO_INF = _ALTO - _ALTO_SUP          # 360
 def _celda(idx: int, ancho: int, alto: int, etiqueta: str, fps: int) -> str:
     """Escala una entrada a una celda 'ancho x alto' SIN deformar.
 
+    'idx' es la posicion de la entrada en la linea de FFmpeg (el 0 de '[0:v]'),
+    y 'etiqueta' el nombre con el que la rama queda disponible para el overlay
+    ('top', 'bl', 'br'). Devuelve un fragmento de filter_complex terminado en
+    ';', pensado para concatenarse con los demas.
+
     force_original_aspect_ratio=decrease conserva la proporcion (una cam 16:9
     nunca se estira); el pad rellena con negro hasta el tamano exacto de la
     celda y centra la imagen. setsar=1 evita que overlay descoloque nada.
@@ -73,10 +78,13 @@ def _celda(idx: int, ancho: int, alto: int, etiqueta: str, fps: int) -> str:
 def _filtro(frontal_idx: int, izq_idx: int, der_idx: int, fps: int) -> str:
     """Cadena filter_complex para el mosaico.
 
-    Los indices son la posicion de cada entrada -i (0,1,2). Cada POV se ajusta a
-    su celda respetando la proporcion 16:9 (letterbox en negro si hace falta),
-    asi ninguna imagen se estira. El frontal (1280x720) se centra arriba; los
-    laterales (960x360) llenan cada mitad inferior.
+    Los tres indices son la posicion de cada entrada -i (0, 1, 2), no ficheros:
+    quien llama decide que POV va en cada sitio pasando el indice que le
+    corresponde. 'fps' es el de grabacion y se aplica a cada rama y a la salida.
+
+    Cada POV se ajusta a su celda respetando la proporcion 16:9 (letterbox en
+    negro si hace falta), asi ninguna imagen se estira. El frontal (1280x720) se
+    centra arriba; los laterales (960x360) llenan cada mitad inferior.
 
     Tres detalles imprescindibles (ver bugs en el docstring del modulo):
       - 'shortest=1' en el primer overlay: el fondo 'color' es infinito y sin
@@ -114,9 +122,13 @@ def generar(carpeta: Path, frontal: str, izquierda: str, derecha: str,
             fps: int = 30, audio_de: str | None = None) -> subprocess.Popen | None:
     """Lanza la generacion de 'mosaico.mkv' en un proceso con ventana propia.
 
-    frontal/izquierda/derecha son nombres de fichero (p.ej. 'cam2.mkv'). El
-    audio se toma de 'audio_de' (por defecto, el frontal). 'fps' debe ser el de
-    grabacion (de config.json): fija el framerate del mosaico.
+    'carpeta' es la del asalto: de ahi salen las entradas y ahi se escribe el
+    resultado. frontal/izquierda/derecha son NOMBRES DE FICHERO sueltos (p.ej.
+    'cam2.mkv'), no rutas, y se resuelven contra 'carpeta'.
+
+    'fps' debe ser el de grabacion (config.json): fija el framerate del mosaico.
+    'audio_de' es el nombre de fichero del que sacar el audio; si es None, o no
+    esta entre los tres, se usa el frontal.
 
     Vuelve enseguida: el proceso corre por su cuenta, con su ventana, y sigue
     aunque se cierre la app. Devuelve el Popen (por si el llamante quiere

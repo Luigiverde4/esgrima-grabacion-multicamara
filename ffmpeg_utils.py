@@ -45,7 +45,14 @@ _TIMEOUT_S = 15
 def _preguntar(fichero: Path, *consulta: str) -> str:
     """Ejecuta ffprobe con esa consulta y devuelve su salida cruda ('' si falla).
 
-    Concentra el manejo de errores: quien llama solo interpreta el texto.
+    'consulta' son los argumentos que van EN MEDIO de la linea de ffprobe: lo
+    comun ('-v error' delante, '-of csv=p=0' y el fichero detras) ya lo pone
+    esta funcion. Es decir, se pasa solo lo que cambia:
+
+        _preguntar(f, "-show_entries", "format=duration")
+
+    Concentra el manejo de errores: quien llama solo interpreta el texto, y una
+    cadena vacia significa siempre 'no se pudo saber'.
     """
     try:
         return subprocess.run(

@@ -111,6 +111,10 @@ def _aplicar_stats(prog: Progreso, stats: dict) -> None:
 def _comando(origen: Path, destino: str, incluye: list[str]) -> list[str]:
     """Linea de rclone para la subida.
 
+    'destino' va en formato de rclone 'remoto:carpeta' (sale de 'rclone_destino'
+    en config.json), no es una ruta local. 'incluye' son los filtros ya montados
+    por _filtros(): lista vacia = subir 'origen' entero.
+
     Se usa 'copy' y NUNCA 'sync': sync borraria en Dropbox todo lo que no
     exista en local, que aqui equivaldria a destruir grabaciones ya subidas.
     """
@@ -143,6 +147,10 @@ def _comando(origen: Path, destino: str, incluye: list[str]) -> list[str]:
 
 def _filtros(origen: Path, carpetas: list[Path] | None) -> list[str]:
     """Filtros --include para limitar la subida a ciertos asaltos.
+
+    'carpetas' son rutas de asalto que deben colgar de 'origen' (las de fuera se
+    ignoran, no rompen la subida). None o lista vacia devuelve [], que en
+    _comando() significa 'subir origen entero'.
 
     Se filtra en vez de copiar cada carpeta por separado para conservar la
     estructura JORNADA/ASALTO en destino y que baste un solo rclone: una sola

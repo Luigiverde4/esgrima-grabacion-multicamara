@@ -1,0 +1,8 @@
+# Normaliza los finales de linea: LF en el repositorio, CRLF en el disco de
+# Windows. Evita que un cambio de editor ensucie el diff de ficheros enteros.
+* text=auto
+
+*.py   text diff=python
+*.md   text
+*.json text
+*.bat  text eol=crlf
