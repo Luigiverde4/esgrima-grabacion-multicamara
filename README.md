@@ -2,15 +2,15 @@
 
 Grabación multicámara de asaltos de esgrima para uso en competición: tres cámaras
 sobre la pista, un fichero por POV y asalto, mosaico de los tres ángulos y subida
-a Dropbox al terminar la jornada.
+a la nube al terminar la jornada.
 
 Aplicación de escritorio para Windows, en Python y Tkinter, **sin dependencias de
 terceros**: todo lo pesado lo hacen FFmpeg y rclone.
 
-> Se usa **en directo** durante una competición, con un operador que puede no ser
-> quien lo programó. Las prioridades del proyecto, por orden: (1) no perder una
-> grabación, (2) hacer visible cualquier fallo al instante, (3) evitar falsas
-> alarmas.
+> Se usa **en directo** durante una competición: mientras hay un asalto en marcha
+> no hay margen para depurar nada, y una grabación perdida no se repite. De ahí las
+> prioridades del proyecto, por orden: (1) no perder una grabación, (2) hacer
+> visible cualquier fallo al instante, (3) evitar falsas alarmas.
 
 ## Índice
 
@@ -30,7 +30,7 @@ Cuatro ejecutables deben estar accesibles en el `PATH`:
 | `ffmpeg` | grabar cada cámara y componer el mosaico |
 | `ffprobe` | verificar las grabaciones |
 | `ffplay` | previsualizar cada cámara en vivo |
-| `rclone` | subir la jornada a Dropbox |
+| `rclone` | subir la jornada al remoto configurado |
 
 En Windows:
 
@@ -38,8 +38,9 @@ En Windows:
 winget install Gyan.FFmpeg Rclone.Rclone
 ```
 
-`rclone` necesita además un remoto configurado (`rclone config`) apuntando a la
-cuenta de Dropbox de destino.
+`rclone` necesita además un remoto configurado (`rclone config`). Sirve cualquiera
+de los que soporta rclone —Dropbox, Google Drive, OneDrive, S3, un servidor SFTP—:
+el proyecto no depende de ninguno en concreto.
 
 ### Hardware
 
@@ -71,7 +72,7 @@ elección se guarda sola.
    opcional — y pulsar **INICIAR ASALTO**.
 2. Pulsar **DETENER ASALTO** al acabar.
 3. Repetir. La numeración es automática y sobrevive a un reinicio de la aplicación.
-4. Al terminar la jornada, **Subir todo a Dropbox**.
+4. Al terminar la jornada, **Subir todo a la nube**.
 
 Durante la grabación, cada cámara muestra un indicador de estado:
 
@@ -143,7 +144,7 @@ no retrocede sobre material ya grabado.
 | `video.preset` | `medium`: mejor compresión a igual calidad. En un equipo justo de CPU, `fast` o `veryfast` alivian a costa de ficheros mayores. |
 | `video.crf` | 22, calidad alta. Menor número = más calidad y más tamaño. Independiente del preset: el crf fija cómo se ve, el preset cuánto ocupa. |
 | `camaras[].dispositivo` | `null` activa el modo prueba (`testsrc2`, sin hardware). Se elige desde la interfaz y persiste. |
-| `rclone_destino` | Formato `remoto:carpeta` de rclone, p. ej. `dropbox:MiCompeticion`. |
+| `rclone_destino` | Formato `remoto:carpeta` de rclone, donde `remoto` es el nombre que le diste en `rclone config`. |
 
 ## Decisiones de diseño
 

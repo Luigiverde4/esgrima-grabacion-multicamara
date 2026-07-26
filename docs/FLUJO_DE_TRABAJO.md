@@ -21,7 +21,7 @@ Sin dependencias externas de Python (solo stdlib). Requiere `ffmpeg`, `ffprobe`,
    `metadata.json` y, si las tres cámaras grabaron bien, se lanza el **mosaico**
    en una ventana aparte. Si alguna cámara falló, salta un aviso modal.
 4. **Repetir** para cada asalto. La numeración es continua toda la competición.
-5. **Subir** al final del día: **Subir todo a Dropbox**.
+5. **Subir** al final del día: **Subir todo a la nube**.
 
 ## Preparación de dispositivos (detalle)
 
@@ -138,7 +138,7 @@ la app sigue sin registro en disco, nunca cae por esto (`_escribir()` traga el
 `OSError`). Ver `_abrir_log()` / `_escribir()` en `app.py`. La carpeta `logs/`
 está en `.gitignore` (material de trabajo).
 
-## Subida a Dropbox
+## Subida a la nube
 
 - **Pensada para el final del día.** `_subir()` recorre `grabaciones/*/*` (todos
   los asaltos de todas las jornadas) y lanza `rclone copy` en un hilo.
@@ -151,7 +151,7 @@ está en `.gitignore` (material de trabajo).
 
 ### Subida selectiva
 
-Además de **"Subir todo a Dropbox"**, la lista de asaltos permite elegir cuáles
+Además de **"Subir todo a la nube"**, la lista de asaltos permite elegir cuáles
 subir: se marcan con **Ctrl/Shift+clic** (`selectmode="extended"`) y se pulsa
 **"Subir seleccionados"** (deshabilitado mientras no haya selección). El resto
 del flujo —confirmación, bloqueo de botones, progreso— es común a ambos botones
@@ -171,10 +171,10 @@ dentro de cada carpeta subida (`_marcar_subidas`). En la lista, esos asaltos
 aparecen con un **`✓` verde** al inicio (`_pintar_lista` + `itemconfig`). Sirve
 para no resubir por error y ver de un vistazo qué queda pendiente.
 
-- Es una marca **local** ("lo subí desde esta app"), no una consulta a Dropbox.
+- Es una marca **local** ("lo subí desde esta app"), no una consulta al remoto.
 - Solo se marca si la subida terminó OK; una subida fallida a medias no marca nada.
 - El `.subido` se **excluye** de la subida (`--exclude .subido` en `subida.py`):
-  es estado local, no debe viajar a Dropbox.
+  es estado local, no debe viajar al remoto.
 - Vive dentro de la carpeta del asalto (que está en `grabaciones/`, ignorada por
   git). No se mezcla con `metadata.json`.
 

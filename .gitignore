@@ -11,7 +11,7 @@ venv/
 config.json
 
 # Grabaciones: material de trabajo, no va al control de versiones.
-# Las graba la app y se suben a OneDrive con rclone.
+# Las graba la app y se suben al remoto configurado con rclone.
 grabaciones/
 
 # Registros de sesion (un .txt por arranque de la app).

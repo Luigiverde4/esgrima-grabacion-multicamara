@@ -1,7 +1,7 @@
 # Arquitectura
 
 Aplicación de escritorio (Windows) para grabar asaltos de esgrima con tres
-cámaras simultáneas, generar un mosaico de los tres POVs y subir todo a Dropbox.
+cámaras simultáneas, generar un mosaico de los tres POVs y subirlo todo a la nube.
 Sin dependencias externas de Python: solo stdlib (Tkinter incluido). Sí requiere
 `ffmpeg`, `ffprobe`, `ffplay` y `rclone` en el PATH.
 

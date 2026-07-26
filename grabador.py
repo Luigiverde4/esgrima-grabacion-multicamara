@@ -762,7 +762,7 @@ class Sesion:
         """Convierte el texto de tiradores en un nombre de carpeta valido.
 
         El operador escribe libremente ("12 47", o "Garcia vs Lopez") y eso
-        acaba siendo un nombre de carpeta que ademas viaja a Dropbox.
+        acaba siendo un nombre de carpeta que ademas viaja a la nube.
 
         Con flags=UNICODE, \\w conserva letras acentuadas y enes: se quitan los
         signos problematicos (/ \\ : * ? " < > |) pero no se destroza el nombre.
@@ -1044,7 +1044,7 @@ class Sesion:
         fin = datetime.now()
         duracion = (fin - info["inicio"]).total_seconds()
 
-        # metadata.json acompana a los videos hasta Dropbox: es el registro de
+        # metadata.json acompana a los videos hasta la nube: es el registro de
         # que se grabo, cuanto duro y si hubo incidencias en alguna camara.
         metadata = {
             "competicion": self.cfg["competicion"],
@@ -1087,7 +1087,7 @@ class Sesion:
         )
 
         # La carpeta se anade al dict devuelto (no al JSON: es una ruta local que
-        # no tiene sentido subir a Dropbox). La usa la app para el mosaico.
+        # no tiene sentido subirla). La usa la app para el mosaico.
         resultado = dict(metadata, carpeta=str(info["carpeta"]))
 
         # Sesion queda libre para el siguiente asalto.

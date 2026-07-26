@@ -1,7 +1,7 @@
 {
   "modo_prueba": false,
   "carpeta_grabaciones": "grabaciones",
-  "rclone_destino": "dropbox:NOMBRE_COMPETICION",
+  "rclone_destino": "REMOTO_RCLONE:NOMBRE_COMPETICION",
   "competicion": "NOMBRE_COMPETICION",
   "ultimo_asalto": 0,
   "video": {

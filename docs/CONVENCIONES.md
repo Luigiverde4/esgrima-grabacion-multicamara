@@ -47,7 +47,7 @@ Fuente de configuración y de estado persistente. Campos:
 {
   "modo_prueba": false,                    // derivado: true si ninguna cámara configurada
   "carpeta_grabaciones": "grabaciones",
-  "rclone_destino": "dropbox:Valencia_Fencing_2026", // remoto:carpeta de rclone
+  "rclone_destino": "remoto:CARPETA_COMPETICION",    // remoto:carpeta de rclone
   "competicion": "Valencia_Fencing_2026",
   "ultimo_asalto": 26,                     // contador continuo; UNICA fuente de la numeracion
   "video": {

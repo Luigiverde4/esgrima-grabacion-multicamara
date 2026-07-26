@@ -311,7 +311,7 @@ una cámara sin micro asignado.
 ## Subida
 
 ### `rclone copy`, nunca `sync`
-`sync` borraría en Dropbox todo lo que no exista en local — destruiría
+`sync` borraría en el destino todo lo que no exista en local — destruiría
 grabaciones ya subidas.
 → `subida.py`, `subir()`.
 

@@ -1,7 +1,7 @@
 [project]
 name = "esgrima"
 version = "2026.0"
-description = "Control de grabacion multicamara de asaltos de esgrima, con mosaico y subida a Dropbox."
+description = "Control de grabacion multicamara de asaltos de esgrima, con mosaico y subida a la nube via rclone."
 requires-python = ">=3.11"
 
 # Sin dependencias de Python: el proyecto usa solo la biblioteca estandar
@@ -14,7 +14,7 @@ dependencies = []
 #   ffmpeg   grabacion y composicion del mosaico
 #   ffprobe  verificacion de las grabaciones
 #   ffplay   previsualizacion en vivo de cada camara
-#   rclone   subida a Dropbox
+#   rclone   subida al remoto configurado
 #
 # En Windows se instalan aparte (p.ej. winget install Gyan.FFmpeg Rclone.Rclone)
 # y deben quedar accesibles desde la linea de comandos.

@@ -1,6 +1,6 @@
 """ESGRIMA_26 - Control de grabacion multicamara.
 
-Interfaz para grabar asaltos con tres camaras y subirlos a Dropbox.
+Interfaz para grabar asaltos con tres camaras y subirlos a la nube.
 
 COMO SE ORGANIZA
     _construir()   monta los widgets una sola vez, al arrancar.
@@ -221,7 +221,7 @@ class App(tk.Tk):
         # Ajustes del mosaico: que camara va grande arriba y de cual sale el
         # audio. Van aqui, con las camaras, y no en la seccion de subida, porque
         # son propiedades de la captura (que POV manda y que micro esta mejor
-        # situado), no del envio a Dropbox.
+        # situado), no del envio a la nube.
         #
         # Etiqueta visible ("cam2 · Frontal") -> id de camara. La comparten los
         # dos desplegables: las opciones son las mismas.
@@ -261,12 +261,12 @@ class App(tk.Tk):
         # --- Subida ---
         # Con el registro fuera, esta seccion absorbe el espacio sobrante: su
         # lista de asaltos crece y se ven mas sin scroll.
-        ms = ttk.LabelFrame(cont, text="Subida a Dropbox", padding=12)
+        ms = ttk.LabelFrame(cont, text="Subida a la nube", padding=12)
         ms.pack(fill="both", expand=True, pady=(0, 10))
 
         f = ttk.Frame(ms)
         f.pack(fill="x")
-        self.btn_subir = ttk.Button(f, text="Subir todo a Dropbox", command=self._subir)
+        self.btn_subir = ttk.Button(f, text="Subir todo a la nube", command=self._subir)
         self.btn_subir.pack(side="left")
         # Sube solo los asaltos marcados en la lista (Ctrl/Shift+clic). Arranca
         # deshabilitado: se activa cuando hay seleccion (ver _actualizar_btn_sel).
@@ -937,7 +937,7 @@ class App(tk.Tk):
                 if i < len(self._asaltos_lista)]
 
     def _subir(self) -> None:
-        """Sube TODAS las grabaciones a Dropbox. Pensado para el final del dia."""
+        """Sube TODAS las grabaciones a la nube. Pensado para el final del dia."""
         self._lanzar_subida(self._asaltos_en_disco(), selectivo=False)
 
     def _subir_seleccionados(self) -> None:
@@ -1038,7 +1038,7 @@ class App(tk.Tk):
             self._pintar_lista()
             self._escribir(mensaje)
             if ok:
-                messagebox.showinfo("Subida completada", "Los asaltos estan en Dropbox.")
+                messagebox.showinfo("Subida completada", "Los asaltos estan en la nube.")
             else:
                 messagebox.showerror("Error en la subida", mensaje)
         self.after(0, aplicar)

@@ -1,10 +1,10 @@
-"""Subida de las grabaciones a Dropbox mediante rclone.
+"""Subida de las grabaciones a la nube mediante rclone.
 
-Se usa el ejecutable de rclone y no una API de Dropbox porque la cuenta ya esta
-configurada ahi, y rclone se encarga por su cuenta de los reintentos y de
+Se usa el ejecutable de rclone y no la API del proveedor porque la cuenta ya
+esta configurada ahi, y rclone se encarga por su cuenta de los reintentos y de
 trocear los ficheros grandes. El remoto concreto sale de 'rclone_destino' en
-config.json ('dropbox:Valencia_Fencing_2026'), asi que cambiar de proveedor no
-toca este modulo: basta configurar otro remoto en rclone y apuntar ahi.
+config.json, en formato 'remoto:carpeta', asi que cambiar de proveedor no toca
+este modulo: basta configurar otro remoto en rclone y apuntar ahi.
 
 La subida corre en un hilo aparte y va informando por callbacks. Quien los
 reciba es responsable de llevarlos a su propio hilo si tiene interfaz grafica
@@ -115,7 +115,7 @@ def _comando(origen: Path, destino: str, incluye: list[str]) -> list[str]:
     en config.json), no es una ruta local. 'incluye' son los filtros ya montados
     por _filtros(): lista vacia = subir 'origen' entero.
 
-    Se usa 'copy' y NUNCA 'sync': sync borraria en Dropbox todo lo que no
+    Se usa 'copy' y NUNCA 'sync': sync borraria en el destino todo lo que no
     exista en local, que aqui equivaldria a destruir grabaciones ya subidas.
     """
     return [
@@ -138,7 +138,7 @@ def _comando(origen: Path, destino: str, incluye: list[str]) -> list[str]:
         "--min-age", "30s",
 
         # El fichero .subido es una marca LOCAL de estado (la escribe la app al
-        # subir con exito); no tiene sentido en Dropbox, se excluye.
+        # subir con exito); no tiene sentido en el destino, se excluye.
         "--exclude", ".subido",
 
         *incluye,                    # vacio => sube todo; si no, solo lo elegido
