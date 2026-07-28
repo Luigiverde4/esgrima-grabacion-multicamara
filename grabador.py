@@ -131,6 +131,32 @@ class GrabadorCamara:
     _TELEMETRIA = ("bitrate=", "total_size=", "out_time", "speed=", "fps=",
                    "dup_frames=", "drop_frames=", "progress=", "stream_")
 
+    # Telemetria a la que dshow le ha pegado su prefijo de modulo por delante:
+    # '[dshow @ 000001f6b27ae440] frame=1649'. Ocurre cuando un aviso de dshow
+    # (tipicamente el 'real-time buffer too full') se emite a la vez que la
+    # telemetria de -progress y ambos acaban entrelazados en la misma linea de
+    # stderr, que no esta sincronizado entre el muxer y el demuxer.
+    #
+    # Sin esto, la linea no casaba con _RE_FRAME (anclado a inicio de linea) ni
+    # con _TELEMETRIA (no empieza por 'frame='), asi que se guardaba como error
+    # real y marcaba la camara como caida al detener: el asalto 028 del
+    # 2026-07-27 se dio por 2/3 con los tres videos intactos, y por eso se
+    # nego el mosaico. Falsa alarma en directo, que es lo que no debe pasar.
+    #
+    # No tapa un fallo real: solo descarta lineas cuyo contenido, quitado el
+    # prefijo, es telemetria conocida. Un error autentico de dshow ('I/O
+    # error', 'Could not run graph') no casa y sigue registrandose. Ademas el
+    # avance de frames se sigue midiendo por las lineas limpias, asi que una
+    # camara congelada la sigue delatando EstadoCamara.bloqueada.
+    _RE_TELEMETRIA_PREFIJADA = re.compile(
+        r"^\[[a-z0-9_]+ @ [0-9a-fx]+\]\s*(?:frame=|"
+        + "|".join(re.escape(t) for t in
+                   ("bitrate=", "total_size=", "out_time", "speed=", "fps=",
+                    "dup_frames=", "drop_frames=", "progress=", "stream_"))
+        + r")",
+        re.IGNORECASE,
+    )
+
     # Avisos benignos de FFmpeg que no deben marcarse como fallo de camara:
     # generarian falsas alarmas en mitad de la competicion.
     #
@@ -152,12 +178,22 @@ class GrabadorCamara:
 
     @classmethod
     def _es_ruido(cls, linea: str) -> bool:
+        if cls._RE_TELEMETRIA_PREFIJADA.match(linea):
+            return True
         bajo = linea.lower()
         return any(r in bajo for r in cls._RUIDO)
 
-    def __init__(self, camara: Camara, cfg: dict):
+    # Letra de cada camara en el nombre de fichero: cam1 -> A, cam2 -> B...
+    # El mosaico usa 'M' (ver mosaico.generar), fuera de esta serie para que se
+    # distinga de un POV de un vistazo.
+    _LETRAS = {"cam1": "A", "cam2": "B", "cam3": "C"}
+
+    def __init__(self, camara: Camara, cfg: dict, prefijo: str = ""):
         self.camara = camara
         self.cfg = cfg
+        # Prefijo con los dos IDs de tirador ("12_47") para nombrar los ficheros.
+        # Vacio = no habia dos numeros; se cae al nombre clasico (ver 'base').
+        self.prefijo = prefijo
         self.estado = EstadoCamara()
         self._proc: subprocess.Popen | None = None
         self._hilo: threading.Thread | None = None
@@ -176,6 +212,27 @@ class GrabadorCamara:
         # para que el video conserve la sincronia con las demas camaras.
         self.huecos: list[float] = []
         self._fin_trozo: float | None = None   # monotonic al morir el ultimo trozo
+
+    @property
+    def base(self) -> str:
+        """Nombre base de los ficheros de esta camara, SIN extension.
+
+        Con los dos IDs de tirador: '12_47_A'. Sin ellos: 'cam1'.
+
+        Es el UNICO sitio donde se decide como se llama un fichero de camara.
+        Todo lo demas (el .mkv definitivo, los trozos de un relanzamiento, los
+        negros temporales y el fichero unido) deriva de aqui, de modo que un
+        asalto nombrado por tiradores y uno sin nombrar recorren exactamente el
+        mismo codigo. Es lo que evita que el relanzamiento -que es la parte
+        delicada- tenga que saber nada de los IDs.
+
+        El respaldo a 'cam1' no es decorativo: si el operador no escribe los dos
+        numeros, la grabacion tiene que salir igualmente. Prioridad 1 del
+        proyecto: no perder un asalto por un campo mal rellenado.
+        """
+        if not self.prefijo:
+            return self.camara.id
+        return f"{self.prefijo}_{self._LETRAS.get(self.camara.id, self.camara.id)}"
 
     def _entrada(self) -> list[str]:
         """Argumentos de entrada segun sea testsrc o capturadora real."""
@@ -267,19 +324,24 @@ class GrabadorCamara:
         return self.carpeta is not None and not self.estado.grabando
 
     def _siguiente_libre(self, carpeta: Path) -> Path:
-        """Primer nombre de trozo sin usar: cam1_b.mkv, cam1_c.mkv...
+        """Primer nombre de trozo sin usar: 12_47_A_b.mkv, 12_47_A_c.mkv...
+        (o cam1_b.mkv, cam1_c.mkv... si el asalto no lleva IDs de tirador).
 
         Se busca por el fichero en disco y no por len(self.trozos) porque un
         intento fallido no deja fichero ni cuenta como trozo: si se numerara por
         la lista, el siguiente relanzamiento podria pisar un trozo bueno.
+
+        La minuscula del trozo no choca con la mayuscula de la camara: '12_47_A'
+        es el POV y '12_47_A_b' su segundo trozo. Son temporales y desaparecen al
+        unir, pero si una union falla quedan en disco y deben poder distinguirse.
         """
         for letra in "bcdefghijklmnopqrstuvwxyz":
-            candidato = carpeta / f"{self.camara.id}_{letra}.mkv"
+            candidato = carpeta / f"{self.base}_{letra}.mkv"
             if not candidato.exists():
                 return candidato
         # 25 relanzamientos en un asalto: inalcanzable en la practica, pero mejor
         # sobrescribir el ultimo que quedarse sin nombre y no poder grabar.
-        return carpeta / f"{self.camara.id}_z.mkv"
+        return carpeta / f"{self.base}_z.mkv"
 
     def _segmento_negro(self, carpeta: Path, indice: int, hueco: float,
                         muestra_audio: int | None = None) -> Path | None:
@@ -301,7 +363,7 @@ class GrabadorCamara:
         """
         v = self.cfg["video"]
         muestra_audio = muestra_audio or 44100
-        destino = carpeta / f"_{self.camara.id}_gap_{indice}.mkv"
+        destino = carpeta / f"_{self.base}_gap_{indice}.mkv"
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-f", "lavfi",
@@ -363,7 +425,7 @@ class GrabadorCamara:
             self.trozos = []
             self.huecos = []
             self.frames_previos = 0
-            destino = carpeta / f"{self.camara.id}.mkv"
+            destino = carpeta / f"{self.base}.mkv"
         else:
             # Se conservan los frames de los trozos anteriores para que el
             # contador de la interfaz siga subiendo en vez de volver a cero.
@@ -511,12 +573,30 @@ class GrabadorCamara:
             # de escribir la 'q'. esperar_cierre() se encarga del resto.
             pass
 
+    # Margen para que FFmpeg vuelque a disco lo que tiene en buffer tras la 'q'.
+    #
+    # Estuvo en 8 s y se quedaba corto: con el bus USB justo, la camara de mayor
+    # bitrate llega al final del asalto con mucha cola sin escribir, agota el
+    # plazo y el terminate() de respaldo se lleva los ultimos segundos. Medido el
+    # 2026-07-27: cam3 cerraba 10-14 s antes que las otras dos de forma
+    # sistematica (asaltos 040, 045, 047), con los tres INICIOS clavados a +-30 ms
+    # -- o sea, no era arranque escalonado sino cierre truncado. Los ficheros
+    # quedaban validos y con duracion correcta; lo que se perdia era material del
+    # final del asalto, justo donde suele estar la ultima accion.
+    #
+    # 20 s cubre el peor caso visto con margen. El coste es el tiempo que la
+    # interfaz se queda quieta al detener, y solo se paga cuando una camara
+    # realmente lo necesita: wait() vuelve en cuanto FFmpeg termina, asi que un
+    # cierre normal (< 1 s) sigue siendo igual de rapido. Los tres esperan en
+    # paralelo, de modo que es el timeout del conjunto, no por camara.
+    TIMEOUT_CIERRE_S = 20
+
     def esperar_cierre(self) -> None:
         """Espera a que FFmpeg acabe de escribir el fichero.
 
         Se llama despues de pedir_parada(). Como los tres esperan en paralelo
-        (ya tienen su 'q' enviada), el timeout de 8 s es del conjunto, no por
-        camara.
+        (ya tienen su 'q' enviada), el timeout es del conjunto, no por camara.
+        Ver TIMEOUT_CIERRE_S para por que vale lo que vale.
 
         Cascada de dos respaldos si no cierra solo:
             terminate() + 5 s  -> fichero valido, sin duracion
@@ -524,7 +604,7 @@ class GrabadorCamara:
         """
         if self._proc and self._proc.poll() is None:
             try:
-                self._proc.wait(timeout=8)
+                self._proc.wait(timeout=self.TIMEOUT_CIERRE_S)
             except subprocess.TimeoutExpired:
                 try:
                     self._proc.terminate()
@@ -778,6 +858,26 @@ class Sesion:
         limpio = re.sub(r"[^\w\s-]", "", texto, flags=re.UNICODE).strip()
         return re.sub(r"[\s-]+", "_", limpio)[:60].strip("_")
 
+    @staticmethod
+    def ids_tiradores(texto: str) -> tuple[str, str] | None:
+        """Los dos numeros de tirador del texto del operador, o None.
+
+        El operador escribe en un unico campo ("12 47", "12-47", "12_47") y de
+        ahi salen los nombres de fichero: 12_47_A.mkv, 12_47_B.mkv...
+
+        Devuelve None si NO hay exactamente dos numeros. Ese None es la senal de
+        "no se puede nombrar por tiradores" y quien llama cae al nombre clasico
+        (cam1.mkv). Se exigen exactamente dos a proposito: con uno solo o con
+        tres, adivinar cual es cual produciria nombres enganosos, y un fichero
+        mal nombrado en una competicion es peor que uno con nombre generico.
+
+        Solo se miran los numeros, asi que un texto con nombres propios
+        ("12 Garcia 47 Lopez") sigue dando ('12', '47'). Se conservan tal cual
+        se escriben, sin rellenar con ceros: el operador reconoce '7' como el 7.
+        """
+        numeros = re.findall(r"\d+", texto or "")
+        return (numeros[0], numeros[1]) if len(numeros) == 2 else None
+
     @property
     def grabando(self) -> bool:
         return self.asalto_actual is not None
@@ -829,9 +929,16 @@ class Sesion:
         # muere durante el asalto, el numero ya esta reservado y no se reutiliza.
         self._guardar_contador(numero)
 
+        # Los dos IDs de tirador nombran los ficheros: 12_47_A.mkv, 12_47_B.mkv,
+        # 12_47_C.mkv (y 12_47_M.mkv el mosaico). Si el operador no escribio dos
+        # numeros, ids_tiradores() da None, el prefijo queda vacio y se graba con
+        # los nombres clasicos cam1/cam2/cam3: nunca se impide grabar por esto.
+        ids = self.ids_tiradores(etiqueta)
+        prefijo = f"{ids[0]}_{ids[1]}" if ids else ""
+
         # Grabadores nuevos en cada asalto: cada uno lleva su propio proceso
         # y su propio hilo, y no se reutilizan una vez terminados.
-        self.grabadores = [GrabadorCamara(c, self.cfg) for c in self.camaras]
+        self.grabadores = [GrabadorCamara(c, self.cfg, prefijo) for c in self.camaras]
         for g in self.grabadores:
             g.iniciar(carpeta)  # arranque secuencial: de ahi el desfase de ~1 s
 
@@ -839,6 +946,7 @@ class Sesion:
             "numero": numero,
             "numero_previsto": previsto,   # != numero si hubo colision
             "etiqueta": etiqueta,
+            "prefijo": prefijo,            # '12_47' o '' si no habia dos IDs
             "carpeta": carpeta,
             "jornada": jornada,
             "inicio": inicio,
@@ -936,8 +1044,8 @@ class Sesion:
             return
 
         carpeta = existentes[0].parent
-        lista = carpeta / f"_concat_{g.camara.id}.txt"
-        unido = carpeta / f"{g.camara.id}_unido.mkv"
+        lista = carpeta / f"_concat_{g.base}.txt"
+        unido = carpeta / f"{g.base}_unido.mkv"
         temporales: list[Path] = []
         try:
             muestra_audio = _muestra_audio(existentes[0])
@@ -1051,6 +1159,11 @@ class Sesion:
             "jornada": info["jornada"],
             "asalto": info["numero"],
             "etiqueta": info["etiqueta"],
+            # Los dos IDs de tirador que nombran los ficheros ('12_47'), o ''
+            # si el operador no escribio dos numeros y se grabo como cam1/2/3.
+            # Queda registrado para saber, ya en la nube, por que un asalto
+            # lleva un esquema de nombres u otro.
+            "prefijo": info.get("prefijo", ""),
             "inicio": info["inicio"].isoformat(timespec="seconds"),
             "fin": fin.isoformat(timespec="seconds"),
             "duracion_s": round(duracion, 1),

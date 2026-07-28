@@ -151,6 +151,57 @@ con ancho suficiente, o pasar esas cámaras a **MJPEG**.
 Regla: el aviso ya no marca la cámara en rojo, pero si aparece, mirar `frames` en
 `metadata.json` antes del siguiente asalto.
 
+## `[dshow @ ...] frame=1649` — cámara marcada como fallida y **mosaico no generado**
+
+**Síntoma:** al terminar el asalto salta "2 de 3 cámaras han fallado" con un
+error de una sola línea con esta pinta:
+
+```
+! cam3: [dshow @ 000001f6b27ae440] frame=1649
+```
+
+y además **no se genera el mosaico**, sin que aparezca ningún aviso en el log
+explicando por qué. Los tres vídeos se reproducen bien.
+
+**Causa:** es **telemetría de `-progress` con el prefijo de módulo de dshow
+pegado por delante**. stderr no está sincronizado entre demuxer y muxer, así que
+un aviso de dshow (típicamente el `real-time buffer` de aquí arriba) y la línea
+`frame=N` se entrelazan y salen fundidos en una sola línea.
+
+Esa línea no casaba con nada:
+- `_RE_FRAME` está anclado a inicio de línea (`^frame=`) **a propósito**, así que
+  el `frame=` precedido del prefijo no contaba como avance;
+- no empieza por ninguno de los prefijos de `_TELEMETRIA`;
+- no contenía ninguna cadena de `_RUIDO`.
+
+Al no ser ninguna de las tres cosas, se guardaba como error real y la cámara se
+declaraba caída al detener, con `intentos: 1` y `segundos_caida: 0.0` — es decir,
+nunca se cayó de verdad.
+
+**El efecto en cadena es lo grave:** `_generar_mosaico()` (en `app.py`) solo
+genera el mosaico si las tres cámaras grabaron bien, y sale por un `return`
+temprano **sin escribir nada en el log**. Un falso positivo en una cámara se
+convierte, silenciosamente, en un asalto sin mosaico.
+
+**Corregido** en `grabador.py` con `_RE_TELEMETRIA_PREFIJADA`, comprobada desde
+`_es_ruido()`: descarta líneas cuyo contenido, quitado el prefijo `[modulo @
+dirección]`, es telemetría conocida. No tapa fallos reales — `I/O error`,
+`Could not run graph`, `Failed to set video format` llevan el mismo prefijo y
+siguen registrándose, porque lo que se compara es lo que va *después*.
+
+**Caso real:** asalto 028 del 2026-07-27. cam3 marcada como fallida; los tres
+`.mkv` intactos (95,1 / 82,3 / 93,5 s, ninguno `N/A`). Mosaico regenerado a mano
+después con `mosaico.generar()`.
+
+**Si vuelve a pasar con otro prefijo de módulo:** regenerar el mosaico del asalto
+sin perder la prueba, con los nombres de fichero en el orden que toque:
+
+```python
+python -c "from pathlib import Path; import mosaico; \
+mosaico.generar(Path('grabaciones/JORNADA/ASALTO'), frontal='cam1.mkv', \
+izquierda='cam2.mkv', derecha='cam3.mkv', fps=30, audio_de='cam1.mkv')"
+```
+
 ## Falsas alarmas de "cámara caída"
 
 **Síntoma:** una cámara se marca en rojo/ámbar durante un asalto aunque graba
@@ -160,6 +211,9 @@ bien.
 - Aviso benigno de FFmpeg (Fontconfig, `deprecated`...) tratado como error →
   debería estar filtrado por `_RUIDO` en `grabador.py`. Si aparece uno nuevo,
   añadirlo **con cuidado de no tapar fallos reales**.
+- Telemetría con el prefijo de módulo pegado delante (`[dshow @ ...] frame=N`) →
+  filtrada por `_RE_TELEMETRIA_PREFIJADA`. Ver la sección propia más arriba:
+  el efecto secundario es que **el asalto se queda sin mosaico en silencio**.
 - Parada nuestra confundida con caída → cubierto por `_detencion_pedida`.
 - "SIN SEÑAL - imagen congelada" (ámbar): frames sin avanzar > 2 s
   (`UMBRAL_CONGELADA_S`). Suele ser **HDMI suelto real**, no falsa alarma.
