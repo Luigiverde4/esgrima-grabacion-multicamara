@@ -39,6 +39,13 @@ LOGS = RAIZ / "logs"
 # Colores de estado, pensados para leerse de un vistazo desde lejos.
 VERDE, ROJO, AMBAR, GRIS = "#1a7f37", "#c9252d", "#bf8700", "#57606a"
 
+# Camaras laterales, por POSICION FISICA en la pista y en el orden de
+# config.json: [cam1, cam2, cam3] = [izquierda, frontal, derecha]. Son las que
+# componen el mosaico de dos (_M2.mkv), que existe precisamente para prescindir
+# de la central. No confundir con "las dos que no van arriba en el mosaico de
+# tres": eso depende de un desplegable y puede incluir la central.
+_LATERALES = ("cam1", "cam3")
+
 
 @dataclass
 class FilaCamara:
@@ -347,11 +354,31 @@ class App(tk.Tk):
             self._iniciar()
 
     def _iniciar(self) -> None:
+        texto = self.entrada.get().strip()
+
+        # Sin los dos numeros de tirador los ficheros salen como cam1/cam2/cam3
+        # en vez de 12_47_A/B/C. Se avisa ANTES de arrancar (aun no se ha tocado
+        # ninguna capturadora) porque despues ya no tiene arreglo: renombrar a
+        # mano en plena competicion es justo lo que se quiere evitar.
+        #
+        # El aviso NO bloquea: se puede seguir con 'Si'. Un asalto empieza cuando
+        # empieza, y perderlo por un campo a medio rellenar seria peor que unos
+        # ficheros con nombre generico (prioridad 1: no perder una grabacion).
+        if self.sesion.ids_tiradores(texto) is None:
+            if not messagebox.askyesno(
+                "Faltan los IDs de tirador",
+                "No se han indicado los DOS numeros de tirador.\n\n"
+                "Los videos se guardaran como cam1 / cam2 / cam3 en vez de\n"
+                "ID1_ID2_A / _B / _C.\n\n"
+                "Grabar de todas formas?"
+            ):
+                return
+
         # Cerrar las previews primero: DirectShow no deja que ffplay y FFmpeg
         # abran la misma capturadora a la vez, y la grabacion fallaria.
         self._cerrar_previews()
         try:
-            info = self.sesion.iniciar_asalto(self.entrada.get().strip())
+            info = self.sesion.iniciar_asalto(texto)
         except Exception as e:
             # Aqui se captura todo a proposito: un fallo al arrancar (permisos,
             # disco lleno, config invalida) debe avisar al operador, nunca
@@ -461,20 +488,45 @@ class App(tk.Tk):
             )
 
     def _generar_mosaico(self, meta: dict, fallos: list) -> None:
-        """Lanza la generacion del mosaico en segundo plano, si procede.
+        """Lanza en segundo plano los mosaicos que procedan.
 
-        Solo si las tres camaras grabaron bien: un mosaico al que le falta un
-        POV no aporta.
+        Son DOS, independientes y simultaneos, cada uno a su fichero:
 
-        Que camara va grande arriba lo elige el operador (desplegable del pie);
-        las otras dos se reparten la fila de abajo conservando el orden de
-        config.json, asi que el mosaico sigue leyendose de izquierda a derecha.
+          - El de tres POVs ('_M.mkv'), solo si las tres camaras grabaron bien:
+            un mosaico al que le falta un POV no aporta. Que camara va grande
+            arriba lo elige el operador (desplegable del pie); las otras dos se
+            reparten la fila de abajo conservando el orden de config.json, asi
+            que el mosaico sigue leyendose de izquierda a derecha.
+
+          - El de las dos laterales ('_M2.mkv'), siempre que ESAS DOS esten bien,
+            aunque la central haya fallado. La central es la que mas se cae en
+            pista y con la regla de arriba un asalto suyo se quedaba sin ninguna
+            vista compuesta, teniendo dos POVs perfectamente validos.
+
+        Que sean dos procesos a la vez es aceptable: el mosaico ya corria fuera
+        de la app y no bloquea la interfaz. Se paga en CPU, no en respuesta.
         """
-        if fallos or len(meta["camaras"]) != 3:
+        if len(meta["camaras"]) != 3:
             return
         carpeta = Path(meta["carpeta"])
         if not all(c["fichero"] for c in meta["camaras"]):
             return
+
+        # El fps sale de config para que los mosaicos casen con la cadencia de
+        # grabacion. Cada mosaico corre en su propio proceso con ventana propia:
+        # muestra el progreso, se cierra sola al terminar y sobrevive aunque se
+        # cierre la app. Por eso no hay callback de vuelta a la interfaz.
+        fps = int(self.sesion.cfg["video"]["fps"])
+
+        # Fichero de la camara elegida para el audio (desplegable del pie).
+        cam_audio = self.sesion.audio_mosaico
+        audio_de = next((c["fichero"] for c in meta["camaras"]
+                         if c["id"] == cam_audio), None)
+
+        # Con IDs de tirador los mosaicos se llaman '12_47_M.mkv' y
+        # '12_47_M2.mkv', junto a sus POV '12_47_A/B/C.mkv'. Sin ellos se quedan
+        # en 'mosaico.mkv' / 'mosaico2.mkv'.
+        prefijo = meta.get("prefijo") or ""
 
         # La elegida arriba; las otras dos abajo, en el orden de config.json.
         # Si la guardada no esta entre las grabadas, se cae a la del medio.
@@ -486,29 +538,63 @@ class App(tk.Tk):
         izq, der = [c["fichero"] for c in meta["camaras"]
                     if c["id"] != cam_arriba]
 
-        # El mosaico corre en su propio proceso con ventana propia: muestra el
-        # progreso, se cierra sola al terminar y sobrevive aunque se cierre la
-        # app. Por eso no hay callback de vuelta a la interfaz; el estado se ve
-        # en esa ventana. El fps sale de config para que el mosaico case con la
-        # cadencia de grabacion.
-        fps = int(self.sesion.cfg["video"]["fps"])
+        # --- Mosaico de tres: exige que las tres hayan grabado bien.
+        if not fallos:
+            proc = mosaico.generar(
+                carpeta, frontal=frontal, izquierda=izq, derecha=der, fps=fps,
+                audio_de=audio_de,
+                salida=f"{prefijo}_M.mkv" if prefijo else "mosaico.mkv",
+            )
+            if proc is None:
+                self._escribir("    ! mosaico omitido: falta algun video")
+            else:
+                self._escribir(
+                    f"Mosaico del asalto {meta['asalto']:03d} generandose en ventana "
+                    f"aparte... (arriba {cam_arriba}, audio de {cam_audio})"
+                )
+        else:
+            self._escribir("    ! mosaico de 3 omitido: alguna camara fallo")
 
-        # Fichero de la camara elegida para el audio (desplegable del pie). Si la
-        # elegida no esta entre las tres, generar() cae al frontal por defecto.
-        cam_audio = self.sesion.audio_mosaico
-        audio_de = next((c["fichero"] for c in meta["camaras"]
-                         if c["id"] == cam_audio), None)
+        # --- Mosaico de dos laterales: exige solo que ESAS DOS esten bien.
+        #
+        # Las laterales son cam1 y cam3 SIEMPRE, por posicion fisica en la pista
+        # (ver ARQUITECTURA.md: [cam1, cam2, cam3] = [izquierda, frontal,
+        # derecha]). NO son "las dos que no van arriba": eso es otra cosa, y solo
+        # coincide si el operador ha puesto la central arriba. Con
+        # 'frontal_mosaico = cam1' -que es una eleccion legitima- el descarte
+        # daba cam2 + cam3, o sea metia la central y perdia una lateral: justo lo
+        # contrario del proposito de este mosaico.
+        laterales = [c for c in meta["camaras"] if c["id"] in _LATERALES]
+        if len(laterales) != 2:
+            self._escribir("    ! mosaico de 2 omitido: no estan cam1 y cam3")
+            return
 
-        proc = mosaico.generar(
-            carpeta, frontal=frontal, izquierda=izq, derecha=der, fps=fps,
+        ids_fallidos = {c["id"] for c in fallos}
+        if any(c["id"] in ids_fallidos for c in laterales):
+            self._escribir("    ! mosaico de 2 omitido: alguna lateral fallo")
+            return
+
+        # En el orden de config.json, que es izquierda -> derecha.
+        lat_izq, lat_der = (c["fichero"] for c in laterales)
+
+        # El audio del mosaico de 2 solo puede salir de una lateral: la central
+        # no es una entrada aqui. Si la elegida es la central, generar_dos cae a
+        # la izquierda; se avisa para que no sorprenda al reproducirlo.
+        if cam_audio not in _LATERALES:
+            self._escribir(f"    ~ mosaico de 2: audio de cam1 "
+                           f"({cam_audio} no esta en este mosaico)")
+
+        proc2 = mosaico.generar_dos(
+            carpeta, izquierda=lat_izq, derecha=lat_der, fps=fps,
             audio_de=audio_de,
+            salida=f"{prefijo}_M2.mkv" if prefijo else "mosaico2.mkv",
         )
-        if proc is None:
-            self._escribir("    ! mosaico omitido: falta algun video")
+        if proc2 is None:
+            self._escribir("    ! mosaico de 2 omitido: falta algun video")
         else:
             self._escribir(
-                f"Mosaico del asalto {meta['asalto']:03d} generandose en ventana "
-                f"aparte... (arriba {cam_arriba}, audio de {cam_audio})"
+                f"Mosaico de 2 (laterales) del asalto {meta['asalto']:03d} "
+                f"generandose en ventana aparte..."
             )
 
     # ------------------------------------------------------------ dispositivos

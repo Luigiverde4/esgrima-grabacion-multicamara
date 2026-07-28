@@ -58,8 +58,15 @@ describe** (son la fuente de verdad; este CLAUDE.md solo indexa).
 - **Invariantes críticas** (detalle y motivo en [docs/DECISIONES.md](docs/DECISIONES.md)):
   MKV no MP4; detener FFmpeg con `q` en stdin (no `terminate`/`kill`); `rclone
   copy` nunca `sync`; los objetos `Camara` son la fuente de verdad al persistir
-  `config.json`; el contador de asaltos se escribe al **iniciar**; el mosaico es
-  un proceso independiente con `.parcial` que se renombra al terminar.
+  `config.json`; el contador de asaltos se escribe al **iniciar**; cada mosaico
+  es un proceso independiente con `.parcial` que se renombra al terminar.
+
+- **Dos mosaicos por asalto:** el de tres POVs (`_M.mkv`, exige que las tres
+  cámaras vayan bien) y el de solo las dos laterales (`_M2.mkv`, exige solo las
+  laterales). El segundo existe porque la cámara central es la que más se cae:
+  sin él, un asalto con la central caída se quedaba sin ninguna vista compuesta.
+  Se lanzan a la vez y no se sustituyen. Para asaltos ya grabados,
+  `python mosaico_laterales.py <carpeta>`.
 
 - **Pendiente (no implementado):** previsualización en vivo simultánea de los
   tres POVs empotrada en la interfaz (requeriría MediaMTX; hoy no hay binario en

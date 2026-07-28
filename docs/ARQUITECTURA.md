@@ -14,7 +14,7 @@ Seis módulos, con la GUI desacoplada del motor.
 | `ffmpeg_utils.py` | Utilidades compartidas de FFmpeg: banderas de consola (`SIN_VENTANA`, `NUEVA_CONSOLA`) y consultas de `ffprobe` (`duracion`, `muestra_audio`, `tiene_audio`). Sin dependencias del resto. | No |
 | `grabador.py` | Motor. `Sesion` coordina el conjunto; `GrabadorCamara` envuelve un proceso FFmpeg y publica su estado en `EstadoCamara`. Numera los asaltos y persiste `config.json`. | No |
 | `dispositivos.py` | Enumeración DirectShow (vídeo y audio) vía FFmpeg, emparejado micro↔cámara y previsualización con `ffplay`. | No |
-| `mosaico.py` | Genera `mosaico.mkv` (1920x1080, tres POVs) en un proceso FFmpeg independiente con ventana propia. | No |
+| `mosaico.py` | Genera los mosaicos (1920x1080) en procesos FFmpeg independientes con ventana propia: `generar()` con los tres POVs y `generar_dos()` con solo las dos laterales. | No |
 | `subida.py` | `rclone copy` en un hilo, con callbacks de progreso (JSON). | No |
 | `app.py` | GUI Tkinter. Sondea `EstadoCamara` cada 500 ms para pintar los semáforos; recibe callbacks de la subida. Punto de entrada. | Sí |
 
@@ -59,6 +59,31 @@ Dos vías distintas, cada una por un motivo:
 - **Mosaico → sin comunicación.** Es un proceso independiente con ventana propia
   (ver abajo). No devuelve nada a la GUI; su estado se ve en su ventana.
 
+## Dos mosaicos por asalto
+
+Al terminar un asalto se lanzan **dos mosaicos independientes**, cada uno a su
+fichero y a la vez (`app.py`, `_generar_mosaico()`):
+
+| Función | Contenido | Fichero | Condición |
+|---|---|---|---|
+| `generar()` | Tres POVs: frontal grande arriba, laterales abajo | `_M.mkv` | Las **tres** cámaras grabaron bien |
+| `generar_dos()` | Solo las dos laterales, lado a lado (960x540 centradas) | `_M2.mkv` | Las **dos laterales** grabaron bien |
+
+El de dos existe porque la cámara central es la que más se cae en pista. El de
+tres se omite entero si falla cualquier cámara, así que sin el de dos un asalto
+con la central caída se quedaba **sin ninguna vista compuesta** pese a tener dos
+POVs perfectamente válidos. No se sustituyen: cuando todo va bien se generan los
+dos.
+
+Ambos comparten `_lanzar()`, que construye el `.bat` y lo lanza; lo único que
+cambia entre ellos es cuántas entradas hay y qué filtro las combina. Pueden
+correr simultáneamente porque tanto el `.parcial` como el `.bat` se derivan del
+**nombre de salida**, distinto en cada uno.
+
+Para asaltos ya grabados hay un script suelto, `mosaico_laterales.py`, que
+recorre una carpeta de asalto o de jornada y genera los `_M2.mkv` que falten
+(con `--secuencial` para no competir por CPU si la app está grabando).
+
 ## El mosaico como proceso independiente
 
 `mosaico.generar()` lanza FFmpeg en un **proceso propio con consola visible**
@@ -82,12 +107,16 @@ y [ERRORES_CONOCIDOS.md](ERRORES_CONOCIDOS.md).
 grabaciones/
   MIERCOLES_22/                jornada (DIA_NN)
     12_47_ID_027/              asalto (TIRADOR1_TIRADOR2_ID_NNN)
-      cam1.mkv                 lateral izquierda
-      cam2.mkv                 frontal
-      cam3.mkv                 lateral derecha
-      mosaico.mkv              tres POVs compuestos
+      12_47_A.mkv              lateral izquierda (cam1)
+      12_47_B.mkv              frontal           (cam2)
+      12_47_C.mkv              lateral derecha   (cam3)
+      12_47_M.mkv              tres POVs compuestos
+      12_47_M2.mkv             solo las dos laterales
       metadata.json            registro del asalto (lo escribe la app al cerrar)
 ```
+
+Sin los dos números de tirador, los ficheros salen como `cam1.mkv`, `cam2.mkv`,
+`cam3.mkv`, `mosaico.mkv` y `mosaico2.mkv`. Ver [CONVENCIONES.md](CONVENCIONES.md).
 
 El orden de cámaras `[cam1, cam2, cam3]` = `[izquierda, frontal, derecha]` es el
 mismo en `config.json`, en `self.sesion.camaras`, en `self.sesion.grabadores` y

@@ -26,15 +26,26 @@ hasta donde llegó. El contenedor lo decide la extensión `.mkv` del destino.
 ### Detener FFmpeg escribiendo `q` en stdin, no con `terminate()`/`kill()`
 Solo el cierre limpio escribe la duración en el contenedor. Por eso el proceso se
 lanza con `stdin=PIPE` y **sin** `-nostdin`. Cascada de tres intentos:
-`q` (8 s) → `terminate()` (5 s) → `kill()`. `terminate()` produce fichero
-reproducible pero sin duración; queda como plan B por timeout.
-→ `grabador.py`, `pedir_parada()` / `esperar_cierre()`.
+`q` (`TIMEOUT_CIERRE_S`, hoy 20 s) → `terminate()` (5 s) → `kill()`.
+`terminate()` produce fichero reproducible pero sin duración; queda como plan B
+por timeout.
+
+El plazo de la `q` estuvo en 8 s y se quedaba corto: con el bus USB justo, la
+cámara de mayor bitrate llega al final del asalto con mucha cola sin escribir,
+agota el plazo y el `terminate()` de respaldo se lleva los últimos segundos.
+Medido el 2026-07-27: cam3 cerraba 10-14 s antes que las otras dos de forma
+sistemática (asaltos 040, 045, 047) con los tres **inicios** clavados a ±30 ms —
+o sea, no era el arranque escalonado sino cierre truncado. Se perdía material del
+final del asalto, justo donde suele estar la última acción. Esperar de más no
+cuesta nada: `wait()` vuelve en cuanto FFmpeg termina, así que un cierre normal
+(< 1 s) sigue siendo igual de rápido.
+→ `grabador.py`, `pedir_parada()` / `esperar_cierre()` / `TIMEOUT_CIERRE_S`.
 
 ### La parada va en dos pasadas: `q` a los tres, luego esperar
 `detener_asalto()` llama primero a `pedir_parada()` en las tres cámaras y solo
 después a `esperar_cierre()`. La `q` es lo que fija el instante de corte, así que
 enviarlas seguidas deja las tres duraciones a menos de un segundo. Haciéndolo
-cámara a cámara (enviar y esperar hasta 8 s, una tras otra), cada cámara seguía
+cámara a cámara (enviar y esperar el timeout entero, una tras otra), cada cámara seguía
 grabando mientras la anterior cerraba: en un caso real salieron 26 / 29 / 33 s.
 Verificado con tres `testsrc2`: 387 frames y 12,900 s en las tres.
 → `grabador.py`, `detener_asalto()` / `pedir_parada()` / `esperar_cierre()`.
@@ -278,6 +289,65 @@ justo lo contrario de la prioridad 2.
 Verificado: éxito → `0` con `mosaico.mkv` renombrado; entrada corrupta → código
 distinto de 0 **sin** renombrar; el `.bat` se borra en ambos casos.
 → `mosaico.py`, `generar()`.
+
+### Hay un segundo mosaico con solo las dos laterales
+El mosaico de tres se omite entero si **cualquier** cámara falla. Como la central
+es la que más se cae en pista, ese asalto se quedaba sin ninguna vista compuesta
+pese a tener dos POVs válidos — prioridad 1 mal servida: el material estaba, pero
+no llegaba a formato revisable.
+
+`generar_dos()` compone **solo las laterales**, lado a lado, y por tanto no le
+afecta que la central falle. Se lanza siempre, a la vez que el de tres y a un
+fichero distinto (`_M2.mkv` / `mosaico2.mkv`): **no lo sustituye**, porque cuando
+las tres van bien el de tres sigue siendo la vista buena.
+
+Cada mosaico comprueba **sus propias** entradas contra la lista de fallos, no la
+del asalto entero. Por eso `_generar_mosaico()` ya no sale antes de tiempo con
+`if fallos: return`: esa salida temprana bloqueaba también el de dos, justo en el
+caso para el que se hizo.
+
+### Las laterales del `_M2` son cam1 y cam3 por posición, no por descarte
+Las entradas del mosaico de dos se eligen por **id fijo** (`_LATERALES =
+("cam1", "cam3")`, la posición física en la pista), nunca como "las dos que no
+van arriba en el mosaico de tres".
+
+Son dos conceptos distintos que **solo coinciden si la central va arriba**. El
+desplegable "Mosaico · arriba" admite cualquier cámara, y con
+`frontal_mosaico = cam1` —elección legítima— el descarte devolvía **cam2 + cam3**:
+metía la central y perdía una lateral, o sea exactamente lo contrario del
+propósito de este mosaico. Fallo real, detectado al revisar un `_M2` generado.
+
+Comprobado con las tres posiciones del desplegable: `M2` sale `A + C` en las
+tres, mientras el de tres sigue variando como debe.
+
+`mosaico_laterales.py` no compartía el fallo: busca `_A`/`_C` por sufijo en
+disco, sin pasar por el desplegable.
+→ `app.py`, `_LATERALES` / `_generar_mosaico()`.
+
+Celdas de **960x540**, que es 16:9 exacto: al coincidir con la proporción de las
+cámaras, el `pad` no añade nada dentro de la celda y la imagen entra entera. Se
+centran verticalmente (banda negra de 270 arriba y abajo) en vez de estirarlas a
+960x1080, que daría el mismo tamaño útil de imagen con geometría más complicada.
+
+Los dos procesos corren **simultáneamente** sin pisarse porque tanto el
+`.parcial` como el `.bat` se derivan del nombre de salida, que es distinto en
+cada uno. Verificado: los dos a la vez sobre el mismo asalto → códigos `0`/`0`,
+temporales separados (`12_47_M.parcial.mkv` / `12_47_M2.parcial.mkv`), sin
+residuales. Se paga en CPU, no en respuesta de la interfaz: el mosaico ya corría
+fuera de la app.
+
+Con una lateral más corta (caída y relanzada), `shortest=0` + `eof_action=pass` +
+`-t duracion_max` hacen que el mosaico dure lo que la **más larga** y la agotada
+quede en negro. Verificado con entradas de 6 s y 4 s: salida de 6,05 s, no de 4.
+→ `mosaico.py`, `generar_dos()` / `_filtro_dos()`; `app.py`, `_generar_mosaico()`.
+
+### `generar` y `generar_dos` comparten `_lanzar`
+Lo único que cambia entre los dos mosaicos es cuántas entradas hay y qué filtro
+las combina. Todo lo demás —entrecomillado para `cmd`, `.parcial`, renombrado y
+el cierre medido del `.bat`— es idéntico y **delicado**, así que vive en
+`_lanzar()` una sola vez: duplicarlo era garantizar que una copia se corrigiera y
+la otra no.
+→ `mosaico.py`, `_lanzar()`.
 
 ### La cámara de arriba del mosaico se elige en la interfaz
 Qué POV va grande arriba lo decide el operador en el desplegable "Mosaico ·
